@@ -1,6 +1,6 @@
 # kagero-mcp
 
-[![status](https://img.shields.io/badge/status-v0.1.0-blue.svg)](#)
+[![status](https://img.shields.io/badge/status-v0.1.1-blue.svg)](#)
 [![MCP protocol](https://img.shields.io/badge/MCP-2025--06--18-blue.svg)](https://modelcontextprotocol.io)
 [![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -15,6 +15,31 @@
 
 > Это **тень** от `niwa` (настоящей agentic OS). Показывает форму, но
 > мастерство — за углом.
+
+## Quickstart: choose your backend
+
+Перед первым запуском выберите backend. По умолчанию — `pi-sdk`, и для него
+**нужна** отдельная npm-зависимость:
+
+```bash
+# Если хотите pi-sdk (in-process, нужен peer-dep):
+npm install @earendil-works/pi-coding-agent
+
+# Или используйте CLI-backend, если бинарь уже стоит:
+export KAGERO_BACKEND=dsh     # или qwen / grok / kimi / mcode / pi-rpc
+kagero prompt "List the files in the current directory"
+```
+
+Если `pi-sdk` не установлен, а `KAGERO_BACKEND` указывает на него, вы получите
+ошибку `Cannot find module '@earendil-works/pi-coding-agent'`. Чтобы этого
+избежать, либо поставьте peer-dep, либо явно выберите один из CLI-backend'ов,
+бинарь которого у вас уже есть (`which dsh` / `which qwen` / ...).
+
+Полный список доступных backend'ов и активный по умолчанию:
+
+```bash
+kagero backends
+```
 
 ## Архитектура
 
@@ -45,6 +70,9 @@ npx kagero-mcp
 ```bash
 npm install @earendil-works/pi-coding-agent
 ```
+
+Без этого `KAGERO_BACKEND=pi-sdk` (по умолчанию) работать не будет — см. секцию
+[Quickstart](#quickstart-choose-your-backend) выше.
 
 ## Использование
 
@@ -79,9 +107,31 @@ Tools exposed:
 - `kagero_resume` — continue a session
 - `kagero_models` — list models
 - `kagero_sessions` — list sessions
-- `kagero_subscribe` — subscribe to live events
+- `kagero_subscribe` — subscribe to live events (returns a `subId`)
+- `kagero_unsubscribe` — release a subscription by `subId`
 - `kagero_abort` — abort an in-flight run
 - `kagero_backends` — list available backends
+
+Подписки на live-события идут через стандартный MCP `notifications/message`
+(MCP 2025-06-18). Каждое событие — `{ kind: "agent_event", subId, sessionId, event }`.
+
+## Безопасность и поведение
+
+- **Schema validation (strict mode).** Все tool-схемы объявлены через
+  `z.object(...).strict()` — это превращает `inputSchema` из косметики в
+  реальный контракт: неизвестные поля отбрасываются с ошибкой до того, как
+  запрос дойдёт до backend'а.
+- **`process.env` passthrough.** CLI-backend'ы запускаются через
+  `spawn(..., { env: process.env })` — subprocess видит всё окружение
+  родителя (включая `ANTHROPIC_API_KEY` и т.п.). Если ваш MCP-хост кладёт
+  секреты в env kagero-процесса, они будут видны и subprocess'ам. Если это
+  нежелательно — запускайте kagero в sandbox-окружении.
+- **stdio-only MCP.** Сервер слушает только stdin/stdout — никакой сетевой
+  поверхности. Это безопасно по умолчанию: kagero-mcp нельзя случайно
+  выставить в сеть.
+- **Resource protection.** Subprocess'ы получают `proc.unref()` (не держат
+  event loop родителя) и 50MB cap на stdout/stderr (защита от OOM при
+  runaway output).
 
 ### As a library
 
@@ -114,7 +164,7 @@ console.log(res.text);
    `buildArgs()` + `parseModels()`.
 `src/backends/pi-sdk.ts` — in-process через dynamic import peer-dep.
 `src/backends/pi-rpc.ts` — JSON-RPC через stdio к `pi --mode rpc`.
-`src/mcp/server.ts` — MCP-сервер с 7 tools.
+`src/mcp/server.ts` — MCP-сервер с 8 tools (см. список выше).
 `src/cli.ts` — CLI entry point.
 
 ## Разработка
@@ -124,7 +174,7 @@ git clone https://github.com/minmax/kagero
 cd kagero
 npm install
 npm run build        # → dist/
-npm test             # 14 tests (unit + integration)
+npm test             # 26 tests (unit + integration, real subprocess + smart fake)
 npm run check        # biome + tsc
 ```
 
