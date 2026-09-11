@@ -68,6 +68,8 @@ export interface PromptOptions {
   cwd?: string;
   modelId?: string;
   timeoutMs?: number;
+  /** Optional session id (for prompt() that wants to attach to a known session). */
+  sessionId?: string;
   onStream?: (chunk: string) => void;
 }
 

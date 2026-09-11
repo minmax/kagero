@@ -23,15 +23,16 @@ export class QwenAgent extends CliBackendAgent {
     const lines = stdout.trim().split("\n").filter(Boolean);
     return lines
       .map((line) => {
-        const [id, displayName, provider, contextWindowStr] = line.split("\t");
+        const [id, displayName, provider, contextWindowStr, supportsToolsStr, supportsVisionStr] =
+          line.split("\t");
         if (!id) return null;
         return {
           id,
           displayName: displayName || id,
           provider: provider || "qwen",
           contextWindow: Number(contextWindowStr) || 8192,
-          supportsTools: true,
-          supportsVision: false,
+          supportsTools: supportsToolsStr === "true",
+          supportsVision: supportsVisionStr === "true",
         };
       })
       .filter((m): m is ModelInfo => m !== null);
