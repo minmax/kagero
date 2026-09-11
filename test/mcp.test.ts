@@ -130,6 +130,7 @@ describe.skipIf(!existsSync(resolve(process.cwd(), "dist/cli.js")))("kagero MCP 
         "kagero_resume",
         "kagero_sessions",
         "kagero_subscribe",
+        "kagero_unsubscribe",
       ]);
     } finally {
       client.close();
