@@ -1,0 +1,15 @@
+node_modules/
+*.log
+.DS_Store
+dist/
+*.tgz
+*.tsbuildinfo
+
+.env
+.env.*
+!.env.example
+.local/
+sessions/
+state/
+*.jsonl
+node-compile-cache/

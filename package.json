@@ -1,0 +1,75 @@
+{
+  "name": "kagero-mcp",
+  "version": "0.1.0",
+  "description": "Kagero — MCP-bait для agentic мира. Common Agent interface поверх pi SDK и CLI-агентов (dsh, qwen, grok, kimi, mcode). Тень от niwa.",
+  "type": "module",
+  "bin": {
+    "kagero-mcp": "dist/cli.js",
+    "kagero": "dist/cli.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && chmod +x dist/cli.js",
+    "clean": "rm -rf dist",
+    "check": "npm run check:format && npm run check:types",
+    "check:format": "biome check .",
+    "check:types": "tsc --noEmit -p tsconfig.json",
+    "fix": "biome check --write .",
+    "lint": "biome check .",
+    "test": "vitest run --typecheck",
+    "test:watch": "vitest --typecheck",
+    "dev": "tsc -p tsconfig.build.json --watch",
+    "prepublishOnly": "npm run clean && npm run build && npm run check"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "agent",
+    "ai",
+    "coding-agent",
+    "pi",
+    "dsh",
+    "qwen",
+    "grok",
+    "kimi",
+    "mcode",
+    "bait",
+    "niwa"
+  ],
+  "author": "Niwa Labs (https://github.com/niwa-labs)",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.79.0"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.9",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/minmax/kagero.git"
+  },
+  "homepage": "https://github.com/minmax/kagero#readme",
+  "bugs": {
+    "url": "https://github.com/minmax/kagero/issues"
+  }
+}
