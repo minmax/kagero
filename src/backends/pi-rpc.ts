@@ -7,6 +7,7 @@
  */
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { resolve } from "node:path";
 import type { Agent, AgentEvent, AgentResponse, ModelInfo, PromptOptions, SessionInfo } from "../agent.js";
 import { AgentError } from "../agent.js";
@@ -41,9 +42,10 @@ export class PiRpcAgent implements Agent {
 
   private proc: ChildProcess | null = null;
   private nextId = 1;
-  private pending = new Map<number, (r: RpcResponse) => void>();
+  private pending = new Map<number, { resolve: (r: RpcResponse) => void; reject: (err: Error) => void }>();
   private subscribers = new Map<string, Set<(e: AgentEvent) => void>>();
   private buffer = "";
+  private collectedText = "";
 
   private start(): ChildProcess {
     if (this.proc) return this.proc;
@@ -52,13 +54,29 @@ export class PiRpcAgent implements Agent {
       stdio: ["pipe", "pipe", "pipe"],
       detached: true,
     });
+    proc.unref();
     proc.stdout?.setEncoding("utf8");
     proc.stdout?.on("data", (chunk: string) => this.ingest(chunk));
     proc.stderr?.on("data", () => {
-      // swallow
+      // swallow — RPC errors are reported via response objects
     });
     proc.on("error", (err) => {
-      throw new AgentError("spawn_failed", err.message, "internal", { binary: bin });
+      // Reject all pending calls so callers don't hang
+      const err2 = new AgentError("spawn_failed", err.message, "internal", { binary: bin });
+      for (const [id, p] of this.pending) {
+        p.reject(err2);
+        this.pending.delete(id);
+      }
+      this.proc = null;
+    });
+    proc.on("close", () => {
+      // Reject all in-flight calls on proc death
+      const err = new AgentError("rpc_closed", "pi rpc subprocess closed unexpectedly", "internal");
+      for (const [id, p] of this.pending) {
+        p.reject(err);
+        this.pending.delete(id);
+      }
+      this.proc = null;
     });
     this.proc = proc;
     return proc;
@@ -67,7 +85,8 @@ export class PiRpcAgent implements Agent {
   private resolveBinary(): string {
     const envPath = process.env["PI_RPC_BIN"] ?? process.env["PI_BINARY"];
     if (envPath && existsSync(envPath)) return envPath;
-    for (const dir of ["/usr/local/bin", "/usr/bin", `${process.env["HOME"]}/.local/bin`]) {
+    const home = homedir();
+    for (const dir of ["/usr/local/bin", "/usr/bin", `${home}/.local/bin`]) {
       const p = resolve(dir, "pi");
       if (existsSync(p)) return p;
     }
@@ -89,10 +108,10 @@ export class PiRpcAgent implements Agent {
       try {
         const parsed: unknown = JSON.parse(line);
         if (isResponse(parsed)) {
-          const resolver = this.pending.get(parsed.id);
-          if (resolver) {
+          const p = this.pending.get(parsed.id);
+          if (p) {
             this.pending.delete(parsed.id);
-            resolver(parsed);
+            p.resolve(parsed);
           }
         } else if (isEvent(parsed)) {
           this.forwardEvent(parsed);
@@ -142,12 +161,22 @@ export class PiRpcAgent implements Agent {
     return new Promise<RpcResponse>((resolveP, rejectP) => {
       const proc = this.start();
       const id = this.nextId++;
-      this.pending.set(id, (r) => {
-        if (r.error) rejectP(new AgentError("rpc_error", r.error.message, "tool", { method }));
-        else resolveP(r);
+      this.pending.set(id, {
+        resolve: (r) => {
+          if (r.error) rejectP(new AgentError("rpc_error", r.error.message, "tool", { method }));
+          else resolveP(r);
+        },
+        reject: (err) => rejectP(err),
       });
       const line = `${JSON.stringify({ type: "request", id, method, params })}\n`;
-      proc.stdin?.write(line);
+      try {
+        if (!proc.stdin?.write(line)) {
+          // backpressure — fall through; ingest handles responses
+        }
+      } catch (err) {
+        this.pending.delete(id);
+        rejectP(new AgentError("rpc_write_failed", (err as Error).message, "tool", { method }));
+      }
     });
   }
 
@@ -155,29 +184,57 @@ export class PiRpcAgent implements Agent {
   // Agent interface
   // ===========================================================================
 
-  async prompt(prompt: string, _opts: PromptOptions = {}): Promise<AgentResponse> {
+  async prompt(prompt: string, opts: PromptOptions = {}): Promise<AgentResponse> {
+    const sessionId = opts.sessionId ?? `prompt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const start = Date.now();
-    const r = await this.call("prompt", { text: prompt });
-    return {
-      text: this.collectText(),
-      durationMs: Date.now() - start,
-      meta: { result: r.result },
-    };
+    try {
+      const r = await this.call("prompt", { text: prompt, ...(opts.modelId ? { model: opts.modelId } : {}) });
+      this.emit(sessionId, { type: "session-end", reason: "completed", at: new Date().toISOString() });
+      return {
+        text: this.collectText(),
+        durationMs: Date.now() - start,
+        ...(opts.modelId ? { modelId: opts.modelId } : {}),
+        meta: { result: r.result },
+      };
+    } catch (err) {
+      this.emit(sessionId, {
+        type: "error",
+        message: (err as Error).message,
+        at: new Date().toISOString(),
+      });
+      this.emit(sessionId, { type: "session-end", reason: "errored", at: new Date().toISOString() });
+      throw err;
+    }
   }
 
-  async resume(sessionId: string, prompt: string, _opts: PromptOptions = {}): Promise<AgentResponse> {
+  async resume(sessionId: string, prompt: string, opts: PromptOptions = {}): Promise<AgentResponse> {
     const start = Date.now();
-    await this.call("switch_session", { id: sessionId });
-    const r = await this.call("follow_up", { text: prompt });
-    return {
-      text: this.collectText(),
-      sessionId,
-      durationMs: Date.now() - start,
-      meta: { result: r.result },
-    };
+    try {
+      await this.call("switch_session", { id: sessionId });
+      const r = await this.call("follow_up", {
+        text: prompt,
+        ...(opts.modelId ? { model: opts.modelId } : {}),
+      });
+      this.emit(sessionId, { type: "session-end", reason: "completed", at: new Date().toISOString() });
+      return {
+        text: this.collectText(),
+        sessionId,
+        durationMs: Date.now() - start,
+        ...(opts.modelId ? { modelId: opts.modelId } : {}),
+        meta: { result: r.result },
+      };
+    } catch (err) {
+      this.emit(sessionId, {
+        type: "error",
+        message: (err as Error).message,
+        at: new Date().toISOString(),
+      });
+      this.emit(sessionId, { type: "session-end", reason: "errored", at: new Date().toISOString() });
+      throw err;
+    }
   }
 
-  async listModels(): Promise<ModelInfo[]> {
+  async listModels(_opts: PromptOptions = {}): Promise<ModelInfo[]> {
     const r = await this.call("list_models");
     const arr =
       (
@@ -197,7 +254,7 @@ export class PiRpcAgent implements Agent {
     }));
   }
 
-  async listSessions(): Promise<SessionInfo[]> {
+  async listSessions(_opts: PromptOptions = {}): Promise<SessionInfo[]> {
     try {
       const r = await this.call("list_sessions");
       const arr =
@@ -242,7 +299,12 @@ export class PiRpcAgent implements Agent {
   }
 
   async abort(_sessionId: string): Promise<void> {
-    await this.call("abort");
+    try {
+      await this.call("abort");
+    } catch {
+      // best-effort: proc may be dead
+    }
+    this.emit(_sessionId, { type: "session-end", reason: "killed", at: new Date().toISOString() });
   }
 
   async dispose(): Promise<void> {
@@ -250,13 +312,14 @@ export class PiRpcAgent implements Agent {
       this.proc.kill();
       this.proc = null;
     }
+    // Reject all in-flight calls so callers don't hang
+    const err = new AgentError("disposed", "PiRpcAgent disposed before response", "internal");
+    for (const [, p] of this.pending) p.reject(err);
     this.pending.clear();
     this.subscribers.clear();
   }
 
   // ---------------------------------------------------------------------------
-
-  private collectedText = "";
 
   private collectText(): string {
     const out = this.collectedText;
