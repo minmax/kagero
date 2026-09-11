@@ -145,12 +145,54 @@ async function cmdBackends(): Promise<number> {
 }
 
 async function cmdMcp(args: string[]): Promise<number> {
+  if (args[0] === "--help" || args[0] === "-h") {
+    printMcpHelp();
+    return 0;
+  }
   const backendFlag = args.find((a) => a.startsWith("--backend="));
-  const backend = (backendFlag ? backendFlag.slice("--backend=".length) : DEFAULT_BACKEND) as BackendName;
+  const requested = backendFlag ? backendFlag.slice("--backend=".length) : DEFAULT_BACKEND;
+  const valid = availableBackends() as string[];
+  if (!valid.includes(requested)) {
+    console.error(`[unknown_backend] ${requested}. Available: ${valid.join(", ")}`);
+    return 2;
+  }
+  const backend = requested as BackendName;
   const server = new KageroMcpServer({ defaultBackend: backend });
+  let stopped = false;
+  const shutdown = async (signal: string): Promise<void> => {
+    if (stopped) return;
+    stopped = true;
+    console.error(`[${signal}] shutting down kagero-mcp`);
+    try {
+      await server.stop();
+    } catch (err) {
+      console.error(`[shutdown_error] ${(err as Error).message}`);
+    }
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGHUP", () => void shutdown("SIGHUP"));
+
   await server.start();
-  // Block forever — stdio server runs until stdin closes
-  return new Promise(() => {});
+  // Block until shutdown signal. Server stops via signal handler above.
+  return new Promise<number>(() => {
+    /* keep alive */
+  });
+}
+
+function printMcpHelp(): void {
+  console.log(`kagero mcp — run as MCP server (stdio)
+
+Usage:
+  kagero mcp [--backend=<name>]
+
+Options:
+  --backend=<name>   default backend for tools (default: $KAGERO_BACKEND or "pi-sdk")
+  -h, --help         show this help
+
+The server blocks until SIGTERM / SIGINT / SIGHUP.
+`);
 }
 
 function printHelp(): void {
