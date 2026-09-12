@@ -1,8 +1,10 @@
 // Tests for the dsh backend against the REAL DeepSeek Harness interface
-// (reviews/dsh-real-interface.md; dsh 0.1.5-rc.1, probed live 2026-09-12).
-// No real dsh is spawned: argv shape and parse are pure functions, the
-// readers run on throw-away HOME fixtures, and the process paths use fake
-// binaries through DSH_BIN.
+// (reviews/dsh-real-interface.md; dsh 0.1.5-rc.1, probed live 2026-09-12) plus
+// the dsh-headless-bridge plugin contract (repo
+// https://github.com/minmax/dsh-bridge — README.md, src/args.ts,
+// src/output.ts). No real dsh is spawned: argv shape and parse are pure
+// functions, the readers run on throw-away HOME fixtures, and the process
+// paths use fake binaries through DSH_BIN.
 
 import { chmodSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
@@ -10,7 +12,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { zstdCompressSync, zstdDecompressSync } from "node:zlib";
 import { CliSpecAgent } from "@kagero/cli-backend";
-import { AgentError } from "@kagero/core";
+import { AgentError, type UsageTelemetry } from "@kagero/core";
 import { afterEach, describe, expect, it } from "vitest";
 import { splitZstdFrames } from "../packages/cli-backend/src/history-readers/dsh.js";
 import {
@@ -49,8 +51,9 @@ const T2 = 1789185633132;
 const T3 = 1789185633133;
 
 // ---------------------------------------------------------------------------
-// argv shape — the headless interface is ONE positional task and -h, nothing
-// else (`dsh --profile headless --help`). No invented flags may appear.
+// argv shape — the bridge grammar: --profile headless, then the bridge flags
+// (--model, --session), then --json, then the positional task LAST
+// (dsh-bridge src/args.ts: a commander `[task...]` variadic).
 // ---------------------------------------------------------------------------
 
 describe("dsh spec — argv shape", () => {
@@ -62,35 +65,50 @@ describe("dsh spec — argv shape", () => {
     ...overrides,
   });
 
-  it("builds the real one-shot invocation: profile flag + positional task", () => {
-    expect(dshSpec.print?.args(ctx())).toEqual(["--profile", "headless", "Reply with exactly: PONG"]);
+  it("builds the bridge invocation: profile flag, --json, positional task last", () => {
+    expect(dshSpec.print?.args(ctx())).toEqual([
+      "--profile",
+      "headless",
+      "--json",
+      "Reply with exactly: PONG",
+    ]);
   });
 
   it("passes the task as a single argv element (injection-safe, no shell)", () => {
     const args = dshSpec.print?.args(ctx({ prompt: "a; rm -rf / && echo $(boom)" }));
-    expect(args).toEqual(["--profile", "headless", "a; rm -rf / && echo $(boom)"]);
+    expect(args).toEqual(["--profile", "headless", "--json", "a; rm -rf / && echo $(boom)"]);
   });
 
-  it("refuses modelId honestly, pointing at settings.yaml / --patch", () => {
-    const err = (() => {
-      try {
-        dshSpec.print?.args(ctx({ opts: { modelId: "MiniMax-M3" } }));
-        return undefined;
-      } catch (e) {
-        return e;
-      }
-    })();
-    expect(err).toBeInstanceOf(AgentError);
-    expect((err as AgentError).code).toBe("unsupported_capability");
-    expect((err as AgentError).message).toContain("agent-default-model");
-    expect((err as AgentError).message).toContain("settings.yaml");
-    expect((err as AgentError).message).toContain("--patch");
+  it("maps opts.modelId to --model before --json, task still last", () => {
+    const args = dshSpec.print?.args(ctx({ opts: { modelId: "minimax/MiniMax-M3" } }));
+    expect(args).toEqual([
+      "--profile",
+      "headless",
+      "--model",
+      "minimax/MiniMax-M3",
+      "--json",
+      "Reply with exactly: PONG",
+    ]);
   });
 
-  it("derives honest capabilities: sessions/history on, resume/models off", () => {
+  it("resume mode maps to --session <id>", () => {
+    const args = dshSpec.print?.args(
+      ctx({ mode: "resume", sessionId: "session-056ceb59-d6f0-46d1-8f0d-5628c3a5dfe8" }),
+    );
+    expect(args).toEqual([
+      "--profile",
+      "headless",
+      "--session",
+      "session-056ceb59-d6f0-46d1-8f0d-5628c3a5dfe8",
+      "--json",
+      "Reply with exactly: PONG",
+    ]);
+  });
+
+  it("derives honest capabilities: sessions/history/resume on, models listing off", () => {
     const caps = deriveCapabilities(dshSpec);
-    expect(caps.resume).toBe(false);
-    expect(caps.models).toBe(false);
+    expect(caps.resume).toBe(true); // bridge --session resume
+    expect(caps.models).toBe(false); // --model selects a route; there is no listing command
     expect(caps.sessions).toBe(true); // projcache sessionsReader
     expect(caps.history).toBe(true); // zstd log reader
     expect(caps.abort).toBe(true);
@@ -103,38 +121,101 @@ describe("dsh spec — argv shape", () => {
 });
 
 // ---------------------------------------------------------------------------
-// parse — the WHOLE stdout is the answer; stderr (the `dsh: reasoning:`
-// stream, `dsh: CODE: …`) is diagnostics and is never parsed into the result.
+// parse — stdout must be exactly one dsh-headless-bridge JSON report line
+// (its RunReport). Plain-text stdout is the stock (bridge-less) runner and is
+// refused with the install hint; stderr (the `dsh: reasoning:` stream) stays
+// diagnostics and is never parsed into the result.
 // ---------------------------------------------------------------------------
 
-describe("dsh spec — print parse", () => {
+describe("dsh spec — print parse (bridge JSON report)", () => {
   const parse = dshSpec.print?.parse;
   const run = { status: "completed", exitCode: 0, signal: null } as unknown as Parameters<
     NonNullable<typeof parse>
   >[2];
 
-  it("takes the whole stdout as the answer, stripping the runner's trailing newline", () => {
-    expect(parse?.("PONG\n", "", run)).toEqual({ text: "PONG" });
+  const reportOf = (overrides: Record<string, unknown> = {}): string =>
+    JSON.stringify({
+      status: "completed",
+      text: "PONG",
+      sessionId: "session-056ceb59-d6f0-46d1-8f0d-5628c3a5dfe8",
+      model: { provider: "minimax", model: "MiniMax-M3" },
+      durationMs: 1179,
+      usage: {
+        inputTokens: 346,
+        outputTokens: 18,
+        totalTokens: 7148,
+        cacheReadTokens: 6784,
+        reasoningTokens: 14,
+      },
+      ...overrides,
+    });
+
+  const parseOrThrow = (stdout: string): unknown => {
+    try {
+      return parse?.(stdout, "", run);
+    } catch (e) {
+      return e;
+    }
+  };
+
+  it("maps the happy report: text, sessionId, modelId `provider/model`, usage", () => {
+    expect(parse?.(reportOf(), "dsh: reasoning:\nnoise", run)).toEqual({
+      text: "PONG",
+      sessionId: "session-056ceb59-d6f0-46d1-8f0d-5628c3a5dfe8",
+      modelId: "minimax/MiniMax-M3",
+      usage: {
+        inputTokens: 346,
+        outputTokens: 18,
+        reasoningTokens: 14,
+        cacheReadTokens: 6784,
+      },
+    });
   });
 
-  it("keeps inner newlines and tolerates a missing trailing one", () => {
-    expect(parse?.("line one\nline two\n", "", run)).toEqual({ text: "line one\nline two" });
-    expect(parse?.("PONG", "", run)).toEqual({ text: "PONG" });
+  it("keeps unknown usage numbers out instead of inventing them", () => {
+    const parsed = parse?.(reportOf({ usage: { inputTokens: 5 } }), "", run) as {
+      usage?: UsageTelemetry;
+    };
+    expect(parsed.usage).toEqual({ inputTokens: 5 });
   });
 
-  it("never invents fields: empty stdout parses to empty text, no session/model", () => {
-    expect(parse?.("", "", run)).toEqual({ text: "" });
+  it("marks a non-completed (non-error) status partial, text still passes through", () => {
+    const parsed = parse?.(reportOf({ status: "aborted" }), "", run) as { partial?: boolean };
+    expect(parsed.partial).toBe(true);
   });
 
-  it("ignores stderr entirely (the reasoning stream is not the answer)", () => {
-    const stderr = "dsh: reasoning:\nThe user wants a single word response. No tools needed.";
-    expect(parse?.("PONG\n", stderr, run)).toEqual({ text: "PONG" });
+  it("status error → AgentError carrying the report's message", () => {
+    const err = parseOrThrow(
+      reportOf({
+        status: "error",
+        error: { code: "MISSING_CREDENTIAL", message: "no credential for route" },
+      }),
+    );
+    expect(err).toBeInstanceOf(AgentError);
+    expect((err as AgentError).code).toBe("cli_error");
+    expect((err as AgentError).message).toBe("no credential for route");
+  });
+
+  it("non-JSON stdout → honest AgentError pointing at the bridge install", () => {
+    for (const stdout of ["PONG\n", "", "dsh: fatal: bad profile\n", "[1, 2]"]) {
+      const err = parseOrThrow(stdout);
+      expect(err).toBeInstanceOf(AgentError);
+      expect((err as AgentError).code).toBe("cli_error");
+      expect((err as AgentError).message).toContain("install dsh-headless-bridge into the headless profile");
+      expect((err as AgentError).message).toContain("dsh-headless-bridge");
+    }
+  });
+
+  it("a JSON line missing the report fields is refused like bridge-less output", () => {
+    const err = parseOrThrow('{"status":"completed"}');
+    expect(err).toBeInstanceOf(AgentError);
+    expect((err as AgentError).message).toContain("not a dsh-headless-bridge JSON report");
   });
 });
 
 // ---------------------------------------------------------------------------
 // Process paths through a fake DSH_BIN — exit!=0 must surface the `dsh:
-// CODE: …` line from stderr; exit 0 must complete with the stdout text.
+// CODE: …` line from stderr; exit 0 must complete with the report fields.
 // ---------------------------------------------------------------------------
 
 function useFakeDsh(script: string): void {
@@ -147,16 +228,20 @@ function useFakeDsh(script: string): void {
 }
 
 describe("dsh agent — process contract (fake DSH_BIN)", () => {
-  it("exit 0 → completed, stdout is the answer, no invented session/model", async () => {
-    useFakeDsh("printf 'PONG\\n'");
+  it("exit 0 → completed, report fields surface (text/session/model/usage)", async () => {
+    useFakeDsh(
+      `printf '{"status":"completed","text":"PONG","sessionId":"session-056ceb59-d6f0-46d1-8f0d-5628c3a5dfe8","model":{"provider":"deepseek-official","model":"deepseek-v4-flash"},"durationMs":1179,"usage":{"inputTokens":346,"outputTokens":18}}\\n'`,
+    );
     const agent = new CliSpecAgent(dshSpec);
     const response = await agent.prompt("Reply with exactly: PONG", {
       workspace: { path: await makeWorkspace() },
     });
     expect(response.status).toBe("completed");
     expect(response.text).toBe("PONG");
-    expect(response.sessionId).toBeUndefined(); // headless cannot pass session ids
-    expect(response.modelId).toBeUndefined(); // dsh does not echo the model
+    expect(response.sessionId).toBe("session-056ceb59-d6f0-46d1-8f0d-5628c3a5dfe8");
+    expect(response.modelId).toBe("deepseek-official/deepseek-v4-flash"); // the REPORTED route
+    expect(response.modelSource).toBe("reported");
+    expect(response.usage).toEqual({ inputTokens: 346, outputTokens: 18 });
     expect(response.meta?.partial).toBeUndefined();
     await agent.dispose();
   });

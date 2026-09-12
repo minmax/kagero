@@ -27,10 +27,12 @@ const ctx = (overrides: Partial<PromptContext> & { prompt: string }): PromptCont
 });
 
 describe("deriveCapabilities — honest defaults per built-in spec", () => {
-  it("dsh: print-only, no resume/models, on-disk sessions/history, wrapper timeout", () => {
+  it("dsh: print-only, bridge resume, no models listing, on-disk sessions/history", () => {
     const caps = deriveCapabilities(dshSpec);
     expect(caps).toMatchObject({
-      resume: false,
+      // The dsh-headless-bridge plugin adds `--session <id>` resume to the
+      // headless profile; model listing still has no CLI surface.
+      resume: true,
       models: false,
       // Sessions/history come from the on-disk readers (projcache projection +
       // multi-frame zstd logs) — the CLI itself exposes neither.
@@ -97,37 +99,71 @@ describe("deriveCapabilities — honest defaults per built-in spec", () => {
 // --- dsh ---------------------------------------------------------------------------
 
 describe("dsh spec", () => {
-  it("builds the headless argv: --profile headless + positional task", () => {
+  it("builds the bridge argv: --profile headless, --json, positional task last", () => {
     const args = dshSpec.print?.args(ctx({ prompt: "run the tests" }));
-    expect(args).toEqual(["--profile", "headless", "run the tests"]);
+    expect(args).toEqual(["--profile", "headless", "--json", "run the tests"]);
   });
 
-  it("refuses modelId with a settings.yaml/--patch hint", () => {
+  it("maps modelId to --model and resume to --session, task last", () => {
+    expect(dshSpec.print?.args(ctx({ prompt: "x", opts: { modelId: "minimax/MiniMax-M3" } }))).toEqual([
+      "--profile",
+      "headless",
+      "--model",
+      "minimax/MiniMax-M3",
+      "--json",
+      "x",
+    ]);
+    expect(
+      dshSpec.print?.args(
+        ctx({ prompt: "x", mode: "resume", sessionId: "session-056ceb59-d6f0-46d1-8f0d-5628c3a5dfe8" }),
+      ),
+    ).toEqual([
+      "--profile",
+      "headless",
+      "--session",
+      "session-056ceb59-d6f0-46d1-8f0d-5628c3a5dfe8",
+      "--json",
+      "x",
+    ]);
+  });
+
+  it("parses the bridge JSON report; plain-text stdout is a bridge-install error", () => {
+    const parsed = dshSpec.print?.parse?.(
+      '{"status":"completed","text":"Hi","sessionId":"session-056ceb59-d6f0-46d1-8f0d-5628c3a5dfe8","model":{"provider":"deepseek-official","model":"deepseek-v4-flash"},"durationMs":5}',
+      "dsh: reasoning:\nnoise",
+      {
+        status: "completed",
+        exitCode: 0,
+        signal: null,
+        stdout: "",
+        stderr: "",
+        durationMs: 1,
+        truncated: false,
+      },
+    );
+    expect(parsed).toEqual({
+      text: "Hi",
+      sessionId: "session-056ceb59-d6f0-46d1-8f0d-5628c3a5dfe8",
+      modelId: "deepseek-official/deepseek-v4-flash",
+    });
     let caught: unknown;
     try {
-      dshSpec.print?.args(ctx({ prompt: "x", opts: { modelId: "MiniMax-M3" } }));
+      dshSpec.print?.parse?.("Hi\n", "", {
+        status: "completed",
+        exitCode: 0,
+        signal: null,
+        stdout: "Hi\n",
+        stderr: "",
+        durationMs: 1,
+        truncated: false,
+      });
     } catch (err) {
       caught = err;
     }
     expect(caught).toBeInstanceOf(AgentError);
     const err = caught as AgentError;
-    expect(err.code).toBe("unsupported_capability");
-    expect(err.message).toContain("settings.yaml");
-  });
-
-  it("takes stdout as the answer, minus the single trailing newline", () => {
-    const parsed = dshSpec.print?.parse?.("Hi\n", "dsh: reasoning:\nnoise", {
-      status: "completed",
-      exitCode: 0,
-      signal: null,
-      stdout: "Hi\n",
-      stderr: "",
-      durationMs: 1,
-      truncated: false,
-    });
-    expect(parsed?.text).toBe("Hi");
-    expect(parsed?.sessionId).toBeUndefined();
-    expect(parsed?.modelId).toBeUndefined();
+    expect(err.code).toBe("cli_error");
+    expect(err.message).toContain("install dsh-headless-bridge into the headless profile");
   });
 });
 
