@@ -9,7 +9,7 @@
  *   kagero models             list models
  *   kagero sessions           list sessions
  *   kagero backends           list backends
- *   kagero mcp                run as MCP server
+ *   kagero mcp [--backend=X]  run as MCP server
  *   kagero version            print version
  */
 
@@ -17,7 +17,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AgentError } from "@kagero/core";
-import { availableBackends, select } from "./registry.js";
+import { availableBackends, registry, select } from "./registry.js";
 
 const VERSION = readVersion();
 const DEFAULT_BACKEND = process.env["KAGERO_BACKEND"] ?? "pi-sdk";
@@ -45,7 +45,7 @@ async function main(argv: string[]): Promise<number> {
       case "backends":
         return await cmdBackends();
       case "mcp":
-        return await cmdMcp();
+        return await cmdMcp(rest);
       default:
         console.error(`Unknown command: ${cmd}`);
         printHelp();
@@ -143,9 +143,62 @@ async function cmdBackends(): Promise<number> {
   return 0;
 }
 
-async function cmdMcp(): Promise<number> {
-  console.error("[mcp_unavailable] the MCP entry point is being rebuilt on the @kagero/mcp factory.");
-  return 2;
+async function cmdMcp(args: string[]): Promise<number> {
+  if (args[0] === "--help" || args[0] === "-h") {
+    printMcpHelp();
+    return 0;
+  }
+  const backendFlag = args.find((a) => a.startsWith("--backend="));
+  const requested =
+    backendFlag !== undefined ? backendFlag.slice("--backend=".length) : DEFAULT_BACKEND;
+  const valid = availableBackends();
+  if (!valid.includes(requested)) {
+    console.error(`[unknown_backend] ${requested}. Available: ${valid.join(", ")}`);
+    return 2;
+  }
+  const { createKageroMcpServer } = await import("@kagero/mcp");
+  const server = createKageroMcpServer({
+    name: "kagero-mcp",
+    version: VERSION,
+    toolPrefix: "kagero",
+    registry,
+    defaultBackend: requested,
+  });
+  let stopped = false;
+  const shutdown = async (signal: string): Promise<void> => {
+    if (stopped) return;
+    stopped = true;
+    console.error(`[${signal}] shutting down kagero-mcp`);
+    try {
+      await server.stop();
+    } catch (err) {
+      console.error(`[shutdown_error] ${(err as Error).message}`);
+    }
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGHUP", () => void shutdown("SIGHUP"));
+
+  await server.start();
+  // Block until a shutdown signal; stop happens in the handler above.
+  return new Promise<number>(() => {
+    /* keep alive */
+  });
+}
+
+function printMcpHelp(): void {
+  console.log(`kagero mcp — run as MCP server (stdio)
+
+Usage:
+  kagero mcp [--backend=<name>]
+
+Options:
+  --backend=<name>   default backend for tools (default: $KAGERO_BACKEND or "pi-sdk")
+  -h, --help         show this help
+
+The server blocks until SIGTERM / SIGINT / SIGHUP.
+`);
 }
 
 function printHelp(): void {
@@ -160,11 +213,11 @@ Commands:
   models                  list models
   sessions                list sessions
   backends                list available backends
-  mcp                     run as MCP server (stdio)
+  mcp [--backend=<name>]  run as MCP server (stdio)
   version                 print version
 
 Environment:
-  KAGERO_BACKEND          default backend
+  KAGERO_BACKEND          default backend (${availableBackends().join(" | ")})
 `);
 }
 

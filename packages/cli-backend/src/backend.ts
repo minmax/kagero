@@ -47,6 +47,7 @@
 
 import { randomUUID } from "node:crypto";
 import type {
+  AcpSessionConfig,
   Agent,
   AgentCapabilities,
   AgentEvent,
@@ -59,11 +60,14 @@ import type {
   RunResult,
   SessionInfo,
 } from "@kagero/core";
-import { AgentError, resolveBinary, resolveWorkspace, runProcess, unsupportedCapability } from "@kagero/core";
-import type { AcpSessionConfig } from "../../core/src/acp.js";
-// AcpClient / AcpSessionConfig are not (yet) re-exported from the @kagero/core
-// barrel; the core suite imports them the same way (test/core-acp.test.ts).
-import { AcpClient } from "../../core/src/acp.js";
+import {
+  AcpClient,
+  AgentError,
+  resolveBinary,
+  resolveWorkspace,
+  runProcess,
+  unsupportedCapability,
+} from "@kagero/core";
 import type { CliSpec, ParsedRun, PrintParser, PromptContext } from "./spec.js";
 import { defaultBinaryEnvVar, deriveCapabilities } from "./spec.js";
 
