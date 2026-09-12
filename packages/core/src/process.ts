@@ -53,6 +53,12 @@ export interface RunOptions {
   readonly onStdoutChunk?: (chunk: string) => void;
   /** SIGTERM → SIGKILL grace. Default 5000 ms. */
   readonly killGraceMs?: number;
+  /**
+   * After the child exits — for any reason — signal its process group once
+   * (SIGTERM) to reap grandchildren that outlived it. Default: the group is
+   * only swept after the stop ladder ran.
+   */
+  readonly sweepGroupOnExit?: boolean;
 }
 
 export interface ResolvedBinary {
@@ -153,6 +159,10 @@ export function runProcess(
     let exitSignal: NodeJS.Signals | null = null;
     let graceTimer: NodeJS.Timeout | undefined;
     let deadlineTimer: NodeJS.Timeout | undefined;
+    // Streaming decoder: a multibyte character split across two read chunks must
+    // survive, so the per-chunk strings handed to onStdoutChunk go through the
+    // stateful decode (the final stdout is assembled from the raw buffers).
+    const stdoutDecoder = new TextDecoder("utf8");
 
     const onAbort = (): void => {
       startLadder("aborted");
@@ -198,6 +208,24 @@ export function runProcess(
         }
       }
 
+      // Post-exit sweep for consumers that cannot tolerate grandchildren: a
+      // child exiting does not mean its group is empty, and nothing else reaps
+      // a detached survivor. No-op on an already-empty group.
+      if (opts.sweepGroupOnExit === true && child.pid !== undefined && child.pid > 0) {
+        try {
+          process.kill(-child.pid, "SIGTERM");
+        } catch {
+          // Group is already gone — sweep done.
+        }
+      }
+
+      // Flush the streaming decoder: an incomplete trailing sequence is held
+      // back until end-of-input, and the consumer must still receive it.
+      if (opts.onStdoutChunk !== undefined) {
+        const tail = stdoutDecoder.decode();
+        if (tail.length > 0) opts.onStdoutChunk(tail);
+      }
+
       const status: RunStatus = spawnFailed
         ? "spawn-failed"
         : stopReason === "timed-out"
@@ -230,7 +258,7 @@ export function runProcess(
       const kept = takeChunk(chunk);
       if (kept.length > 0) {
         stdoutParts.push(kept);
-        opts.onStdoutChunk?.(kept.toString("utf8"));
+        opts.onStdoutChunk?.(stdoutDecoder.decode(kept, { stream: true }));
       }
     });
     child.stderr?.on("data", (chunk: Buffer) => {

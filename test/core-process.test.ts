@@ -169,6 +169,43 @@ describe("runProcess — output cap and streaming", () => {
     expect(chunks.join("")).toBe(res.stdout);
     expect(res.stdout).toBe("chunk-one;chunk-two;");
   });
+
+  it("keeps multibyte characters intact when a read chunk splits one", async () => {
+    // ~600KB of 3-byte characters: the 64KB pipe reads cannot stay aligned, so
+    // several characters land split across chunk boundaries. Per-chunk
+    // toString() would corrupt each of them into U+FFFD; the streaming decoder
+    // must not. (P(no split at all) ≈ (1/3)^9 — effectively never.)
+    const chunks: string[] = [];
+    const res = await runProcess(process.execPath, ["-e", `process.stdout.write("あ".repeat(200_000))`], {
+      onStdoutChunk: (chunk) => chunks.push(chunk),
+    });
+    expect(res.status).toBe("completed");
+    expect(chunks.join("")).toBe(res.stdout);
+    expect(res.stdout).not.toContain("\uFFFD");
+    expect(res.stdout.length).toBe(200_000);
+  });
+});
+
+describe("runProcess — sweepGroupOnExit", () => {
+  it("reaps grandchildren that outlived a clean exit", async () => {
+    const grandchildSleep = "60467"; // unique seconds — pgrep marker
+    const script = [
+      `const { spawn } = require("node:child_process");`,
+      // stdio "ignore" — with pipes the unref'd grandchild keeps this node alive.
+      `const c = spawn("sleep", ["${grandchildSleep}"], { stdio: "ignore" }); c.unref();`,
+      `process.stdout.write("done");`,
+    ].join("\n");
+    const res = await runProcess(process.execPath, ["-e", script], {
+      sweepGroupOnExit: true,
+    });
+    expect(res.status).toBe("completed");
+
+    // The grandchild shares the child's process group → swept as well.
+    if (isLinuxOrMac) {
+      const probe = spawnSync("pgrep", ["-f", `sleep ${grandchildSleep}`]);
+      expect(probe.status).not.toBe(0); // no match → no orphan
+    }
+  }, 15_000);
 });
 
 describe("runProcess — spawn options", () => {
