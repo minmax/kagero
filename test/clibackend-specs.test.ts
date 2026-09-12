@@ -216,7 +216,7 @@ describe("codex spec", () => {
     const args = codexSpec.print?.args(
       ctx({ prompt: "go on", mode: "resume", sessionId: "thr-9", opts: { approvalMode: "yolo" } }),
     );
-    expect(args).toEqual(["exec", "resume", "thr-9", "--json", "go on"]);
+    expect(args).toEqual(["exec", "resume", "thr-9", "--json", "--skip-git-repo-check", "go on"]);
   });
 
   it("parses codex JSONL: thread id, last agent_message, cumulative usage", () => {

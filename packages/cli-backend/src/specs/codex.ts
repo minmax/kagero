@@ -36,8 +36,18 @@ const codexSpec: CliSpec = {
       if (ctx.mode === "resume" && ctx.sessionId !== undefined) {
         // resume has no -C/-s: cwd and sandbox are inherited from the session.
         // --json must ride along: without it the resume run prints human text
-        // and the JSONL parser would find nothing.
-        return ["exec", "resume", ctx.sessionId, "--json", ...modelArgs, ctx.prompt];
+        // and the JSONL parser would find nothing. --skip-git-repo-check is
+        // accepted by `exec resume` too; without it a resume outside a trusted
+        // git repo fails with "Not inside a trusted directory".
+        return [
+          "exec",
+          "resume",
+          ctx.sessionId,
+          "--json",
+          "--skip-git-repo-check",
+          ...modelArgs,
+          ctx.prompt,
+        ];
       }
       return [
         "exec",
