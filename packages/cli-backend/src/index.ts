@@ -28,6 +28,7 @@ export type {
   PrintTransport,
   PromptContext,
   SessionsCommand,
+  SessionsReader,
 } from "./spec.js";
 export {
   defaultBinaryEnvVar,
