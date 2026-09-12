@@ -17,7 +17,7 @@
 
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { delimiter as pathDelimiter, join as joinPath } from "node:path";
+import { join as joinPath, delimiter as pathDelimiter } from "node:path";
 
 import { AgentError } from "./agent.js";
 
@@ -72,9 +72,7 @@ export function resolveBinary(binary: string, envVar?: string): ResolvedBinary {
       return { path: fromEnv, source: "env" };
     }
   }
-  const searchedDirs = (process.env.PATH ?? "")
-    .split(pathDelimiter)
-    .filter((dir) => dir !== "");
+  const searchedDirs = (process.env.PATH ?? "").split(pathDelimiter).filter((dir) => dir !== "");
   for (const dir of searchedDirs) {
     const candidate = joinPath(dir, binary);
     if (existsSync(candidate)) return { path: candidate, source: "path" };
@@ -83,12 +81,11 @@ export function resolveBinary(binary: string, envVar?: string): ResolvedBinary {
     envVar !== undefined && envVar !== ""
       ? ` Set ${envVar} to the full binary path, or put "${binary}" on PATH.`
       : ` Put "${binary}" on PATH.`;
-  throw new AgentError(
-    "binary_not_found",
-    `Binary "${binary}" not found (searched PATH).${hint}`,
-    "user",
-    { binary, envVar, searchedDirs: searchedDirs.length },
-  );
+  throw new AgentError("binary_not_found", `Binary "${binary}" not found (searched PATH).${hint}`, "user", {
+    binary,
+    envVar,
+    searchedDirs: searchedDirs.length,
+  });
 }
 
 /**
@@ -96,7 +93,11 @@ export function resolveBinary(binary: string, envVar?: string): ResolvedBinary {
  * pid > 0: kill(-0) would signal OUR process group. When the group is
  * already gone, fall back to a direct kill of the child.
  */
-const signalStop = (pid: number | undefined, childKill: (signal: NodeJS.Signals) => boolean, sig: NodeJS.Signals): void => {
+const signalStop = (
+  pid: number | undefined,
+  childKill: (signal: NodeJS.Signals) => boolean,
+  sig: NodeJS.Signals,
+): void => {
   if (pid !== undefined && pid > 0) {
     try {
       process.kill(-pid, sig);
@@ -249,9 +250,12 @@ export function runProcess(
     });
 
     if (opts.timeoutMs !== undefined) {
-      deadlineTimer = setTimeout(() => {
-        startLadder("timed-out");
-      }, Math.max(0, opts.timeoutMs));
+      deadlineTimer = setTimeout(
+        () => {
+          startLadder("timed-out");
+        },
+        Math.max(0, opts.timeoutMs),
+      );
     }
     opts.signal?.addEventListener("abort", onAbort, { once: true });
   });

@@ -3,8 +3,8 @@ import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
 import { resolveWorkspace } from "@kagero/core";
+import { afterEach, describe, expect, it } from "vitest";
 
 const scratchDirs: string[] = [];
 

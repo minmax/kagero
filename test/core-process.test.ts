@@ -2,8 +2,8 @@
 // combined output caps, and binary resolution.
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { describe, expect, it } from "vitest";
 import { AgentError, resolveBinary, runProcess } from "@kagero/core";
+import { describe, expect, it } from "vitest";
 
 /** Run `fn` with process.env[name] set to value, restoring afterwards. */
 const withEnv = (name: string, value: string, fn: () => void): void => {

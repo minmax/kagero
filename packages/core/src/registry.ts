@@ -7,7 +7,7 @@
  * creation never poisons later attempts.
  */
 
-import { AgentError, type Agent } from "./agent.js";
+import { type Agent, AgentError } from "./agent.js";
 
 export type BackendFactory = () => Agent | Promise<Agent>;
 

@@ -1,7 +1,8 @@
 // Unit tests for the canonical compact history renderer.
-import { describe, expect, it } from "vitest";
-import { renderHistory, truncateForHistory } from "@kagero/core";
+
 import type { HistoryEntry, HistoryResult } from "@kagero/core";
+import { renderHistory, truncateForHistory } from "@kagero/core";
+import { describe, expect, it } from "vitest";
 
 /** Build an ISO timestamp whose local wall clock renders as the given time. */
 const at = (hours: number, minutes: number, seconds: number): string =>
@@ -20,7 +21,10 @@ interface ResultVariant {
 }
 
 const makeResult = (variant: ResultVariant = {}): HistoryResult => {
-  const fullLog = variant.fullLog === "none" ? undefined : variant.fullLog ?? { file: "/tmp/kagero/sess-abc.jsonl", line: 1 };
+  const fullLog =
+    variant.fullLog === "none"
+      ? undefined
+      : (variant.fullLog ?? { file: "/tmp/kagero/sess-abc.jsonl", line: 1 });
   return {
     sessionId: "sess-abc",
     totalEntries: 5,

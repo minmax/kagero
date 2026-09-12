@@ -1,8 +1,9 @@
 // Unit tests for the open backend registry: caching, single-flight, failure
 // isolation, duplicate refusal, parallel dispose.
-import { describe, expect, it, vi } from "vitest";
-import { AgentError, BackendRegistry, createRegistry } from "@kagero/core";
+
 import type { Agent } from "@kagero/core";
+import { AgentError, BackendRegistry, createRegistry } from "@kagero/core";
+import { describe, expect, it, vi } from "vitest";
 
 const unused = async (): Promise<never> => {
   throw new Error("not used in registry tests");
@@ -139,9 +140,12 @@ describe("BackendRegistry — disposeAll", () => {
   });
 
   it("ignores dispose errors", async () => {
-    const broken = makeAgent("broken", vi.fn(async () => {
-      throw new Error("dispose exploded");
-    }));
+    const broken = makeAgent(
+      "broken",
+      vi.fn(async () => {
+        throw new Error("dispose exploded");
+      }),
+    );
     const healthy = makeAgent("healthy");
     const registry = new BackendRegistry();
     registry.register("broken", () => broken);
