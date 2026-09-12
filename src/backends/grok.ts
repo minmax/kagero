@@ -1,7 +1,7 @@
 /**
  * grok backend — wraps the grok CLI.
  */
-import type { ModelInfo, PromptOptions } from "../agent.js";
+import type { ModelInfo, PromptOptions } from "@kagero/core";
 import { CliBackendAgent } from "./base.js";
 
 export class GrokAgent extends CliBackendAgent {

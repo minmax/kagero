@@ -7,7 +7,7 @@ import {
   type AgentResponse,
   type ModelInfo,
   type SessionInfo,
-} from "../src/agent.js";
+} from "@kagero/core";
 import { availableBackends, select } from "../src/registry.js";
 
 describe("availableBackends", () => {

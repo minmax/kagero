@@ -12,8 +12,8 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import type { Agent, AgentEvent, AgentResponse, ModelInfo, PromptOptions, SessionInfo } from "../agent.js";
-import { AgentError } from "../agent.js";
+import type { Agent, AgentEvent, AgentResponse, ModelInfo, PromptOptions, SessionInfo } from "@kagero/core";
+import { AgentError } from "@kagero/core";
 
 const DEFAULT_KILL_GRACE_MS = 5_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024 * 1024; // 50MB

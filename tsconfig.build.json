@@ -1,12 +1,15 @@
 {
-  "extends": "./tsconfig.json",
+  "extends": "./tsconfig.base.json",
   "compilerOptions": {
     "noEmit": false,
-    "outDir": "./dist",
-    "rootDir": "./src",
-    "declaration": false,
-    "declarationMap": false
+    "outDir": "dist",
+    "rootDir": "src",
+    "baseUrl": ".",
+    "paths": {
+      "@kagero/core": ["packages/core/src/index.ts"],
+      "@kagero/pi-backend": ["packages/pi-backend/src/index.ts"]
+    }
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist", "test"]
+  "exclude": ["node_modules", "dist"]
 }

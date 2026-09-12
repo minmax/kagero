@@ -1,0 +1,29 @@
+{
+  "name": "@kagero/core",
+  "version": "0.2.0",
+  "description": "Kagero core — Agent contract, open registry, process runner. Zero runtime dependencies.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/minmax/kagero.git",
+    "directory": "packages/core"
+  }
+}

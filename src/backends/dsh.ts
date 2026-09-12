@@ -3,7 +3,7 @@
  *
  * Pattern after dsh-cli-mcp. Subprocess-based.
  */
-import type { ModelInfo, PromptOptions } from "../agent.js";
+import type { ModelInfo, PromptOptions } from "@kagero/core";
 import { CliBackendAgent } from "./base.js";
 
 export class DshAgent extends CliBackendAgent {

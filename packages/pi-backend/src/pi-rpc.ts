@@ -9,8 +9,8 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import type { Agent, AgentEvent, AgentResponse, ModelInfo, PromptOptions, SessionInfo } from "../agent.js";
-import { AgentError } from "../agent.js";
+import type { Agent, AgentEvent, AgentResponse, ModelInfo, PromptOptions, SessionInfo } from "@kagero/core";
+import { AgentError } from "@kagero/core";
 
 type RpcResponse = {
   type: "response";

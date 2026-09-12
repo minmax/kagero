@@ -16,7 +16,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AgentError } from "./agent.js";
+import { AgentError } from "@kagero/core";
 import { KageroMcpServer } from "./mcp/server.js";
 import { availableBackends, type BackendName, select } from "./registry.js";
 

@@ -4,8 +4,8 @@
  * Backends are loaded lazily (only if the required peer-dep is installed).
  */
 
-import type { Agent } from "./agent.js";
-import { AgentError } from "./agent.js";
+import type { Agent } from "@kagero/core";
+import { AgentError } from "@kagero/core";
 
 export type BackendName = "pi-sdk" | "pi-rpc" | "dsh" | "qwen" | "grok" | "kimi" | "mcode";
 
@@ -15,7 +15,7 @@ type BackendFactory = () => Agent | Promise<Agent>;
 const factories: Record<BackendName, BackendFactory | undefined> = {
   "pi-sdk": async () => {
     try {
-      const mod = await import("./backends/pi-sdk.js");
+      const mod = await import("@kagero/pi-backend");
       return new mod.PiSdkAgent();
     } catch (err) {
       throw new AgentError(
@@ -26,7 +26,7 @@ const factories: Record<BackendName, BackendFactory | undefined> = {
     }
   },
   "pi-rpc": async () => {
-    const mod = await import("./backends/pi-rpc.js");
+    const mod = await import("@kagero/pi-backend");
     return new mod.PiRpcAgent();
   },
   dsh: async () => {

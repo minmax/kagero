@@ -1,0 +1,40 @@
+{
+  "name": "@kagero/pi-backend",
+  "version": "0.2.0",
+  "description": "Kagero pi backends — in-process pi SDK adapter and `pi --mode rpc` subprocess adapter.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@kagero/core": "*"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.79.0"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/minmax/kagero.git",
+    "directory": "packages/pi-backend"
+  }
+}

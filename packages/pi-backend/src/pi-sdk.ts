@@ -9,8 +9,8 @@
  * PiSdkAgent throws a clear error.
  */
 
-import type { Agent, AgentEvent, AgentResponse, ModelInfo, PromptOptions, SessionInfo } from "../agent.js";
-import { AgentError } from "../agent.js";
+import type { Agent, AgentEvent, AgentResponse, ModelInfo, PromptOptions, SessionInfo } from "@kagero/core";
+import { AgentError } from "@kagero/core";
 
 // Type alias for the SDK's AgentSession — we don't import the module
 // statically so missing peer-dep doesn't break the build.
