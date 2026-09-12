@@ -75,6 +75,14 @@ export interface SessionsCommand {
   parse(stdout: string): SessionInfo[];
 }
 
+/**
+ * On-disk session listing for CLIs that persist sessions but expose no
+ * listing command. `homeDir` redirects the HOME root (tests); production
+ * callers invoke the reader without arguments. The result is ordered
+ * newest-first and may be capped — it is a listing, not an archive.
+ */
+export type SessionsReader = (opts?: { readonly homeDir?: string }) => Promise<SessionInfo[]>;
+
 /** Per-backend reader over the CLI's on-disk conversation logs. */
 export interface HistoryReader {
   read(sessionId: string, opts: HistoryOptions | undefined): Promise<HistoryResult>;
@@ -117,6 +125,8 @@ export interface CliSpec {
   readonly acp?: AcpTransportSpec;
   readonly models?: ModelsCommand;
   readonly sessions?: SessionsCommand;
+  /** File-based listing alternative to `sessions` (spec.dsh's projcache scan). */
+  readonly sessionsReader?: SessionsReader;
   readonly history?: HistoryReader;
   readonly limits?: LimitsSupport;
   /** Explicit capability overrides; otherwise derived from which spec parts exist. */
@@ -144,7 +154,7 @@ export function deriveCapabilities(spec: CliSpec): AgentCapabilities {
   return {
     resume: overrides?.resume ?? (spec.print?.resumeCapable === true || spec.acp !== undefined),
     models: overrides?.models ?? spec.models !== undefined,
-    sessions: overrides?.sessions ?? spec.sessions !== undefined,
+    sessions: overrides?.sessions ?? (spec.sessions !== undefined || spec.sessionsReader !== undefined),
     history: overrides?.history ?? spec.history !== undefined,
     // Lifecycle events (session-start/end, error) are emitted for every run.
     subscribe: overrides?.subscribe ?? true,

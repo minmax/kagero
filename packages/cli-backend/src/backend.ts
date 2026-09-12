@@ -38,8 +38,10 @@
  * unsupported_capability.
  *
  * listModels/listSessions run their spec command (probe budget, default 60s);
- * history delegates to spec.history.read; anything without a strategy throws
- * unsupportedCapability — honest refusal, never an empty success.
+ * listSessions falls back to the spec's on-disk sessionsReader when the CLI
+ * has no listing command; history delegates to spec.history.read; anything
+ * without a strategy throws unsupportedCapability — honest refusal, never an
+ * empty success.
  *
  * dispose() aborts every active run, disposes the ACP clients (stop ladder),
  * and clears subscriptions.
@@ -437,13 +439,18 @@ export class CliSpecAgent implements Agent {
 
   async listSessions(): Promise<SessionInfo[]> {
     this.assertNotDisposed();
-    const sessions = this.spec.sessions;
-    if (sessions === undefined) {
-      throw unsupportedCapability(
-        "session listing",
-        `${this.name} exposes no session listing command; set sessions in the spec.`,
-      );
+    if (this.spec.sessions === undefined) {
+      // File-based listing (CLI has sessions on disk but no listing command).
+      const sessionsReader = this.spec.sessionsReader;
+      if (sessionsReader === undefined) {
+        throw unsupportedCapability(
+          "session listing",
+          `${this.name} exposes no session listing command; set sessions or sessionsReader in the spec.`,
+        );
+      }
+      return sessionsReader();
     }
+    const sessions = this.spec.sessions;
     const result = await this.runProbe(sessions.args());
     if (result.status !== "completed") {
       throw new AgentError("cli_error", `${this.name} session listing failed (${result.status})`, "tool", {
