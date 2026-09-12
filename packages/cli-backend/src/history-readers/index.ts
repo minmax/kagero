@@ -6,6 +6,8 @@
 
 export { createClaudeHistoryReader } from "./claude.js";
 export { createCodexHistoryReader } from "./codex.js";
+export { createDshHistoryReader } from "./dsh.js";
+export { readDshSessions } from "./dsh-sessions.js";
 export { createGrokHistoryReader } from "./grok.js";
 export { createKimiHistoryReader } from "./kimi.js";
 export { createMcodeHistoryReader } from "./mcode.js";
