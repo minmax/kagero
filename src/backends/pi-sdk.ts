@@ -56,6 +56,7 @@ export class PiSdkAgent implements Agent {
           case "message_update": {
             const inner = ev.assistantMessageEvent as { type?: string; delta?: string } | undefined;
             if (inner?.type === "text_delta" && typeof inner.delta === "string") {
+              this.collectedText += inner.delta;
               this.emit(sessionId, { type: "assistant-text", content: inner.delta, at });
             }
             break;

@@ -30,7 +30,7 @@ export interface McpServerOptions {
 export class KageroMcpServer {
   private mcp: McpServer;
   private agents = new Map<string, Agent>();
-  private getAgentPromise: Promise<Agent> | null = null;
+  private getAgentPromises = new Map<string, Promise<Agent>>();
   private defaultBackend: BackendName | string;
   private readonly eventSubscribers = new Map<string, () => void>();
 
@@ -43,7 +43,7 @@ export class KageroMcpServer {
         title: "Kagero MCP",
       },
       {
-        capabilities: { tools: {} },
+        capabilities: { tools: {}, logging: {} },
         instructions:
           "Kagero unifies 7 agent backends (pi-sdk, pi-rpc, dsh, qwen, grok, kimi, mcode) behind one MCP interface. " +
           "Use kagero_prompt for one-shot prompts. Override `backend` per call if needed. " +
@@ -241,21 +241,26 @@ export class KageroMcpServer {
   }
 
   /**
-   * Get-or-create the agent for the given backend. Race-safe via a single-flight
-   * promise so concurrent calls with the same backend share one Agent instance,
-   * and calls with different backends don't dispose each other.
+   * Get-or-create the agent for the given backend. Single-flight per backend
+   * name: concurrent calls with the same backend share one Agent instance and
+   * one failure, and a failure never poisons later calls for other backends.
    */
   private getAgent(override?: string): Promise<Agent> {
     const name = override ?? this.defaultBackend;
     const existing = this.agents.get(name);
     if (existing) return Promise.resolve(existing);
-    if (this.getAgentPromise) return this.getAgentPromise;
-    this.getAgentPromise = select(name).then((agent) => {
-      this.agents.set(name, agent);
-      this.getAgentPromise = null;
-      return agent;
-    });
-    return this.getAgentPromise;
+    const inFlight = this.getAgentPromises.get(name);
+    if (inFlight) return inFlight;
+    const creating = select(name)
+      .then((agent) => {
+        this.agents.set(name, agent);
+        return agent;
+      })
+      .finally(() => {
+        this.getAgentPromises.delete(name);
+      });
+    this.getAgentPromises.set(name, creating);
+    return creating;
   }
 
   async start(): Promise<void> {
