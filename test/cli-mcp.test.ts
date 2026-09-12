@@ -174,7 +174,9 @@ describe.skipIf(!existsSync(CLI))("kagero mcp over stdio (dist/cli.js)", () => {
     }
   });
 
-  it("kagero_prompt runs the substituted binary (backend override) and returns its text", { timeout: 15_000 }, async () => {
+  it("kagero_prompt runs the substituted binary (backend override) and returns its text", {
+    timeout: 15_000,
+  }, async () => {
     if (!fake) fake = makeFakeBin();
     const client = new McpClient({ DSH_BIN: fake.bin, FAKE_CLI_MODE: "dsh" });
     try {
@@ -215,7 +217,9 @@ describe.skipIf(!existsSync(CLI))("kagero CLI (dist/cli.js)", () => {
   });
 
   it("mcp --backend=<unknown> is rejected with exit code 2", { timeout: 15_000 }, async () => {
-    const child = spawn(process.execPath, [CLI, "mcp", "--backend=nope"], { stdio: ["ignore", "ignore", "pipe"] });
+    const child = spawn(process.execPath, [CLI, "mcp", "--backend=nope"], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
     let stderr = "";
     child.stderr?.setEncoding("utf8");
     child.stderr?.on("data", (chunk: string) => {

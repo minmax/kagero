@@ -149,8 +149,7 @@ async function cmdMcp(args: string[]): Promise<number> {
     return 0;
   }
   const backendFlag = args.find((a) => a.startsWith("--backend="));
-  const requested =
-    backendFlag !== undefined ? backendFlag.slice("--backend=".length) : DEFAULT_BACKEND;
+  const requested = backendFlag !== undefined ? backendFlag.slice("--backend=".length) : DEFAULT_BACKEND;
   const valid = availableBackends();
   if (!valid.includes(requested)) {
     console.error(`[unknown_backend] ${requested}. Available: ${valid.join(", ")}`);

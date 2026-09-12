@@ -7,7 +7,7 @@
  * hardcode backend names.
  */
 
-import { AgentError, createRegistry, type BackendRegistry } from "@kagero/core";
+import { AgentError, type BackendRegistry, createRegistry } from "@kagero/core";
 
 export const registry: BackendRegistry = createRegistry();
 

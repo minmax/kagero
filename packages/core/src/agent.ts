@@ -72,9 +72,7 @@ export interface AgentResponse {
 }
 
 /** Run in a fresh scratch directory (`{create: true}`) or an explicit one. */
-export type WorkspaceOption =
-  | { readonly create: true; readonly parent?: string }
-  | { readonly path: string };
+export type WorkspaceOption = { readonly create: true; readonly parent?: string } | { readonly path: string };
 
 export interface PromptOptions {
   readonly cwd?: string;

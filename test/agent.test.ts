@@ -1,6 +1,7 @@
 // Contract tests for the shared pieces that must hold before any backend work.
-import { describe, expect, it } from "vitest";
+
 import { AgentError, unsupportedCapability } from "@kagero/core";
+import { describe, expect, it } from "vitest";
 
 describe("AgentError", () => {
   it("carries code, kind and context", () => {

@@ -341,7 +341,10 @@ export class PiRpcAgent implements Agent {
   }
 
   async history(_sessionId: string, _opts?: HistoryOptions): Promise<HistoryResult> {
-    throw unsupportedCapability("history", "use the pi backend's own session files via a history reader spec.");
+    throw unsupportedCapability(
+      "history",
+      "use the pi backend's own session files via a history reader spec.",
+    );
   }
 
   async dispose(): Promise<void> {
