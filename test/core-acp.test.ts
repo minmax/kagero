@@ -23,6 +23,7 @@ interface ClientSpec {
   readonly env?: Record<string, string>;
   readonly onEvent?: (e: AgentEvent, sessionId: string) => void;
   readonly permissionOption?: string;
+  readonly protocolVersion?: number | string;
 }
 
 function makeClient(spec: ClientSpec = {}): { client: AcpClient; logPath: string } {
@@ -33,6 +34,7 @@ function makeClient(spec: ClientSpec = {}): { client: AcpClient; logPath: string
     env: { ...process.env, FAKE_ACP_LOG: logPath, ...spec.env },
     onEvent: spec.onEvent ?? (() => {}),
     ...(spec.permissionOption !== undefined ? { permissionOption: spec.permissionOption } : {}),
+    ...(spec.protocolVersion !== undefined ? { protocolVersion: spec.protocolVersion } : {}),
   });
   clients.push(client);
   return { client, logPath };
@@ -109,6 +111,34 @@ describe("AcpClient handshake and sessions", () => {
       expect(option).toMatchObject({ sessionId: "sess-fake-1", configId: "model", value: "grok-4" });
     } finally {
       await client.dispose();
+    }
+  });
+
+  it("sends protocolVersion 1 (integer) by default and the configured override verbatim", {
+    timeout: TIMEOUT,
+  }, async () => {
+    // Default: the integer 1.
+    const fallback = makeClient();
+    try {
+      await fallback.client.start();
+      await fallback.client.initialize();
+      const entries = await waitForLog(fallback.logPath, (entry) => methodOf(entry) === "initialize");
+      const params = paramsOf(entries.find((entry) => methodOf(entry) === "initialize"));
+      expect(params["protocolVersion"]).toBe(1);
+    } finally {
+      await fallback.client.dispose();
+    }
+
+    // Override: grok wants the STRING "1" on the wire.
+    const stringVersion = makeClient({ protocolVersion: "1" });
+    try {
+      await stringVersion.client.start();
+      await stringVersion.client.initialize();
+      const entries = await waitForLog(stringVersion.logPath, (entry) => methodOf(entry) === "initialize");
+      const params = paramsOf(entries.find((entry) => methodOf(entry) === "initialize"));
+      expect(params["protocolVersion"]).toBe("1");
+    } finally {
+      await stringVersion.client.dispose();
     }
   });
 

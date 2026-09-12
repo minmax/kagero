@@ -3,7 +3,9 @@
  *
  * The child speaks JSON-RPC 2.0 as NDJSON on stdin/stdout. The protocol facts
  * this client relies on (the same ones every ACP agent speaks):
- *   - `initialize` opens the connection (protocolVersion is the integer 1);
+ *   - `initialize` opens the connection (protocolVersion defaults to the
+ *     integer 1; AcpClientOptions.protocolVersion overrides it for CLIs that
+ *     want the string "1", e.g. grok);
  *   - `session/new` (or `session/load`) opens the conversation;
  *   - `session/set_mode` / `session/set_config_option` apply mode and model;
  *   - `session/prompt` is the user turn, `session/update` notifications carry
@@ -59,6 +61,12 @@ export interface AcpClientOptions {
   /** Timeout for the initialize / session-new / load handshake. Default 15000. */
   readonly handshakeTimeoutMs?: number;
   readonly clientInfo?: { readonly name: string; readonly version: string };
+  /**
+   * `initialize` protocolVersion value. Default 1 (the integer every ACP
+   * agent speaks); some CLIs want the STRING "1" (grok sends a string) —
+   * pass "1" to match them byte-for-byte.
+   */
+  readonly protocolVersion?: number | string;
 }
 
 /** One config option for session/set_config_option. */
@@ -125,6 +133,7 @@ export class AcpClient {
   private readonly opts: AcpClientOptions;
   private readonly handshakeTimeoutMs: number;
   private readonly permissionOptionId: string;
+  private readonly protocolVersion: number | string;
   private readonly pending = new Map<number, PendingRequest>();
   private nextId = 1;
   private child: ChildProcess | null = null;
@@ -144,6 +153,7 @@ export class AcpClient {
     this.opts = opts;
     this.handshakeTimeoutMs = opts.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
     this.permissionOptionId = opts.permissionOption ?? DEFAULT_PERMISSION_OPTION;
+    this.protocolVersion = opts.protocolVersion ?? 1;
   }
 
   /** The open ACP session id, or null before session/new / session/load. */
@@ -289,7 +299,7 @@ export class AcpClient {
     await this.request(
       "initialize",
       {
-        protocolVersion: 1,
+        protocolVersion: this.protocolVersion,
         clientInfo: this.opts.clientInfo ?? { name: DEFAULT_CLIENT_NAME, version: DEFAULT_CLIENT_VERSION },
         clientCapabilities: {},
       },
