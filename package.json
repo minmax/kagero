@@ -15,7 +15,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "npm run build -w @kagero/core && npm run build -w @kagero/pi-backend && tsc -p tsconfig.build.json && chmod +x dist/cli.js",
+    "build": "npm run build -w @kagero/core && npm run build -w @kagero/pi-backend && npm run build -w @kagero/cli-backend && npm run build -w @kagero/mcp && tsc -p tsconfig.build.json && chmod +x dist/cli.js",
     "clean": "rm -rf dist packages/*/dist",
     "check": "npm run check:format && npm run check:types",
     "check:format": "biome check .",

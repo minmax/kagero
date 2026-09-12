@@ -8,7 +8,8 @@
     "paths": {
       "@kagero/core": ["packages/core/src/index.ts"],
       "@kagero/pi-backend": ["packages/pi-backend/src/index.ts"],
-      "@kagero/cli-backend": ["packages/cli-backend/src/index.ts"]
+      "@kagero/cli-backend": ["packages/cli-backend/src/index.ts"],
+      "@kagero/mcp": ["packages/mcp/src/index.ts"]
     }
   },
   "include": ["src/**/*.ts", "test/**/*.ts", "vitest.config.ts", "packages/*/src/**/*.ts"],
