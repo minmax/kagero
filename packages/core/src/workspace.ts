@@ -6,6 +6,11 @@
  * echoed back on every AgentResponse so a caller can find the artifacts.
  */
 
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
 import type { WorkspaceOption } from "./agent.js";
 
 export interface WorkspaceInfo {
@@ -28,7 +33,18 @@ export async function resolveWorkspace(
   opt: WorkspaceOption | undefined,
   fallbackCwd?: string,
 ): Promise<WorkspaceInfo> {
-  void opt;
-  void fallbackCwd;
-  throw new Error("not implemented");
+  if (opt === undefined) {
+    const cwd = path.resolve(fallbackCwd ?? process.cwd());
+    return { cwd, path: cwd, created: false };
+  }
+  if ("create" in opt) {
+    const parent = path.resolve(opt.parent ?? os.tmpdir());
+    await mkdir(parent, { recursive: true });
+    const dir = await mkdtemp(path.join(parent, "kagero-ws-"));
+    return { cwd: dir, path: dir, created: true };
+  }
+  const target = path.resolve(opt.path);
+  const created = !existsSync(target);
+  await mkdir(target, { recursive: true });
+  return { cwd: target, path: target, created };
 }
