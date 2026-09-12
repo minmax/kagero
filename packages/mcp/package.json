@@ -1,0 +1,34 @@
+{
+  "name": "@kagero/mcp",
+  "version": "0.2.0",
+  "description": "Kagero MCP layer — an MCP server factory that exposes @kagero/core agents as honest tools.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/minmax/kagero.git",
+    "directory": "packages/mcp"
+  },
+  "dependencies": {
+    "@kagero/core": "*",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.6.2"
+  }
+}
