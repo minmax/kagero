@@ -1,6 +1,7 @@
-import type { Agent, AgentEvent, AgentResponse, ModelInfo, PromptOptions, SessionInfo } from "@kagero/core";
+import type { Agent, AgentCapabilities, AgentEvent, AgentResponse, HistoryOptions, HistoryResult, MidRunCommand, ModelInfo, PromptOptions, SessionInfo } from "@kagero/core";
 export declare class PiRpcAgent implements Agent {
     readonly name = "pi-rpc";
+    readonly capabilities: AgentCapabilities;
     private proc;
     private nextId;
     private pending;
@@ -18,6 +19,8 @@ export declare class PiRpcAgent implements Agent {
     listSessions(_opts?: PromptOptions): Promise<SessionInfo[]>;
     subscribe(sessionId: string, onEvent: (e: AgentEvent) => void): () => void;
     abort(_sessionId: string): Promise<void>;
+    send(_sessionId: string, message: string, kind?: MidRunCommand): Promise<void>;
+    history(_sessionId: string, _opts?: HistoryOptions): Promise<HistoryResult>;
     dispose(): Promise<void>;
     private collectText;
     private emit;

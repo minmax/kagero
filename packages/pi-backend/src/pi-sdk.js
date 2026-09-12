@@ -8,9 +8,21 @@
  * @earendil-works/pi-coding-agent package is not installed, instantiating
  * PiSdkAgent throws a clear error.
  */
-import { AgentError } from "@kagero/core";
+import { AgentError, unsupportedCapability } from "@kagero/core";
 export class PiSdkAgent {
     name = "pi-sdk";
+    capabilities = {
+        resume: true,
+        models: true,
+        sessions: false,
+        history: false,
+        subscribe: true,
+        abort: true,
+        steer: true,
+        followUp: true,
+        limits: { timeout: false, maxTurns: false, maxToolCalls: false },
+        workspaceCreate: true,
+    };
     session = null;
     subscribers = new Map();
     async init() {
@@ -83,14 +95,13 @@ export class PiSdkAgent {
         const session = this.requireSession();
         const start = Date.now();
         await session.prompt(prompt);
-        const out = {
+        const m = session.getModel?.()?.id;
+        return {
+            status: "completed",
             text: this.collectText(),
             durationMs: Date.now() - start,
+            ...(m ? { modelId: m, modelSource: "reported" } : {}),
         };
-        const m = session.getModel?.()?.id;
-        if (m)
-            out.modelId = m;
-        return out;
     }
     async resume(sessionId, prompt, _opts = {}) {
         await this.init();
@@ -98,15 +109,14 @@ export class PiSdkAgent {
         const start = Date.now();
         // The pi SDK doesn't have a clean "resume by id" — for now we use followUp
         await session.followUp(prompt);
-        const out = {
+        const m = session.getModel?.()?.id;
+        return {
+            status: "completed",
             text: this.collectText(),
             sessionId,
             durationMs: Date.now() - start,
+            ...(m ? { modelId: m, modelSource: "reported" } : {}),
         };
-        const m = session.getModel?.()?.id;
-        if (m)
-            out.modelId = m;
-        return out;
     }
     async listModels() {
         await this.init();
@@ -142,6 +152,17 @@ export class PiSdkAgent {
             if (set && set.size === 0)
                 this.subscribers.delete(sessionId);
         };
+    }
+    async send(sessionId, message, kind = "steer") {
+        void sessionId;
+        const session = this.requireSession();
+        if (kind === "follow_up")
+            await session.followUp(message);
+        else
+            await session.steer(message);
+    }
+    async history(_sessionId, _opts) {
+        throw unsupportedCapability("history", "pi sessions live inside the SDK process in v0.2.");
     }
     async abort(_sessionId) {
         const session = this.requireSession();

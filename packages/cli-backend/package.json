@@ -1,0 +1,32 @@
+{
+  "name": "@kagero/cli-backend",
+  "version": "0.2.0",
+  "description": "Kagero data-driven CLI backends — CliSpec + CliSpecAgent over @kagero/core plumbing.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@kagero/core": "*"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/minmax/kagero.git",
+    "directory": "packages/cli-backend"
+  }
+}

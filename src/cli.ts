@@ -4,7 +4,7 @@
  * kagero CLI — the main entry point.
  *
  * Subcommands:
- *   kagero prompt <text>     one-shot prompt
+ *   kagero prompt <text>      one-shot prompt
  *   kagero resume <id> <text> resume a session
  *   kagero models             list models
  *   kagero sessions           list sessions
@@ -17,11 +17,10 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AgentError } from "@kagero/core";
-import { KageroMcpServer } from "./mcp/server.js";
-import { availableBackends, type BackendName, select } from "./registry.js";
+import { availableBackends, select } from "./registry.js";
 
 const VERSION = readVersion();
-const DEFAULT_BACKEND = (process.env["KAGERO_BACKEND"] ?? "pi-sdk") as BackendName;
+const DEFAULT_BACKEND = process.env["KAGERO_BACKEND"] ?? "pi-sdk";
 
 async function main(argv: string[]): Promise<number> {
   const [cmd, ...rest] = argv;
@@ -40,13 +39,13 @@ async function main(argv: string[]): Promise<number> {
       case "resume":
         return await cmdResume(rest);
       case "models":
-        return await cmdModels(rest);
+        return await cmdModels();
       case "sessions":
-        return await cmdSessions(rest);
+        return await cmdSessions();
       case "backends":
         return await cmdBackends();
       case "mcp":
-        return await cmdMcp(rest);
+        return await cmdMcp();
       default:
         console.error(`Unknown command: ${cmd}`);
         printHelp();
@@ -98,7 +97,7 @@ async function cmdResume(args: string[]): Promise<number> {
   }
 }
 
-async function cmdModels(_args: string[]): Promise<number> {
+async function cmdModels(): Promise<number> {
   const backend = process.env["KAGERO_BACKEND"] ?? DEFAULT_BACKEND;
   const agent = await select(backend);
   try {
@@ -117,7 +116,7 @@ async function cmdModels(_args: string[]): Promise<number> {
   }
 }
 
-async function cmdSessions(_args: string[]): Promise<number> {
+async function cmdSessions(): Promise<number> {
   const backend = process.env["KAGERO_BACKEND"] ?? DEFAULT_BACKEND;
   const agent = await select(backend);
   try {
@@ -144,55 +143,9 @@ async function cmdBackends(): Promise<number> {
   return 0;
 }
 
-async function cmdMcp(args: string[]): Promise<number> {
-  if (args[0] === "--help" || args[0] === "-h") {
-    printMcpHelp();
-    return 0;
-  }
-  const backendFlag = args.find((a) => a.startsWith("--backend="));
-  const requested = backendFlag ? backendFlag.slice("--backend=".length) : DEFAULT_BACKEND;
-  const valid = availableBackends() as string[];
-  if (!valid.includes(requested)) {
-    console.error(`[unknown_backend] ${requested}. Available: ${valid.join(", ")}`);
-    return 2;
-  }
-  const backend = requested as BackendName;
-  const server = new KageroMcpServer({ defaultBackend: backend });
-  let stopped = false;
-  const shutdown = async (signal: string): Promise<void> => {
-    if (stopped) return;
-    stopped = true;
-    console.error(`[${signal}] shutting down kagero-mcp`);
-    try {
-      await server.stop();
-    } catch (err) {
-      console.error(`[shutdown_error] ${(err as Error).message}`);
-    }
-    process.exit(0);
-  };
-  process.on("SIGTERM", () => void shutdown("SIGTERM"));
-  process.on("SIGINT", () => void shutdown("SIGINT"));
-  process.on("SIGHUP", () => void shutdown("SIGHUP"));
-
-  await server.start();
-  // Block until shutdown signal. Server stops via signal handler above.
-  return new Promise<number>(() => {
-    /* keep alive */
-  });
-}
-
-function printMcpHelp(): void {
-  console.log(`kagero mcp — run as MCP server (stdio)
-
-Usage:
-  kagero mcp [--backend=<name>]
-
-Options:
-  --backend=<name>   default backend for tools (default: $KAGERO_BACKEND or "pi-sdk")
-  -h, --help         show this help
-
-The server blocks until SIGTERM / SIGINT / SIGHUP.
-`);
+async function cmdMcp(): Promise<number> {
+  console.error("[mcp_unavailable] the MCP entry point is being rebuilt on the @kagero/mcp factory.");
+  return 2;
 }
 
 function printHelp(): void {
@@ -211,7 +164,7 @@ Commands:
   version                 print version
 
 Environment:
-  KAGERO_BACKEND          default backend (pi-sdk | pi-rpc | dsh | qwen | grok | kimi | mcode)
+  KAGERO_BACKEND          default backend
 `);
 }
 

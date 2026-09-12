@@ -9,7 +9,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { AgentError } from "@kagero/core";
+import { AgentError, unsupportedCapability } from "@kagero/core";
 function isResponse(x) {
     return (typeof x === "object" &&
         x !== null &&
@@ -21,6 +21,18 @@ function isEvent(x) {
 }
 export class PiRpcAgent {
     name = "pi-rpc";
+    capabilities = {
+        resume: true,
+        models: true,
+        sessions: true,
+        history: false,
+        subscribe: true,
+        abort: true,
+        steer: true,
+        followUp: true,
+        limits: { timeout: false, maxTurns: false, maxToolCalls: false },
+        workspaceCreate: true,
+    };
     proc = null;
     nextId = 1;
     pending = new Map();
@@ -168,13 +180,13 @@ export class PiRpcAgent {
         const sessionId = opts.sessionId ?? `prompt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const start = Date.now();
         try {
-            const r = await this.call("prompt", { text: prompt, ...(opts.modelId ? { model: opts.modelId } : {}) });
+            await this.call("prompt", { text: prompt, ...(opts.modelId ? { model: opts.modelId } : {}) });
             this.emit(sessionId, { type: "session-end", reason: "completed", at: new Date().toISOString() });
             return {
+                status: "completed",
                 text: this.collectText(),
                 durationMs: Date.now() - start,
-                ...(opts.modelId ? { modelId: opts.modelId } : {}),
-                meta: { result: r.result },
+                ...(opts.modelId ? { modelId: opts.modelId, modelSource: "requested" } : {}),
             };
         }
         catch (err) {
@@ -191,17 +203,17 @@ export class PiRpcAgent {
         const start = Date.now();
         try {
             await this.call("switch_session", { id: sessionId });
-            const r = await this.call("follow_up", {
+            await this.call("follow_up", {
                 text: prompt,
                 ...(opts.modelId ? { model: opts.modelId } : {}),
             });
             this.emit(sessionId, { type: "session-end", reason: "completed", at: new Date().toISOString() });
             return {
+                status: "completed",
                 text: this.collectText(),
                 sessionId,
                 durationMs: Date.now() - start,
-                ...(opts.modelId ? { modelId: opts.modelId } : {}),
-                meta: { result: r.result },
+                ...(opts.modelId ? { modelId: opts.modelId, modelSource: "requested" } : {}),
             };
         }
         catch (err) {
@@ -264,6 +276,17 @@ export class PiRpcAgent {
             // best-effort: proc may be dead
         }
         this.emit(_sessionId, { type: "session-end", reason: "killed", at: new Date().toISOString() });
+    }
+    async send(_sessionId, message, kind = "steer") {
+        if (kind === "follow_up") {
+            await this.call("follow_up", { text: message });
+        }
+        else {
+            await this.call("steer", { text: message });
+        }
+    }
+    async history(_sessionId, _opts) {
+        throw unsupportedCapability("history", "use the pi backend's own session files via a history reader spec.");
     }
     async dispose() {
         if (this.proc) {

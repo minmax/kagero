@@ -8,6 +8,7 @@ export default defineConfig({
     alias: {
       "@kagero/core": r("./packages/core/src/index.ts"),
       "@kagero/pi-backend": r("./packages/pi-backend/src/index.ts"),
+      "@kagero/cli-backend": r("./packages/cli-backend/src/index.ts"),
     },
   },
   test: {

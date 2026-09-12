@@ -1,7 +1,6 @@
 /**
- * kagero — public API.
+ * kagero — public API. Re-exports the core contract plus the root registry.
  */
 
-export type { Agent, AgentEvent, AgentResponse, ModelInfo, PromptOptions, SessionInfo } from "@kagero/core";
-export { AgentError } from "@kagero/core";
-export { availableBackends, type BackendName, select } from "./registry.js";
+export * from "@kagero/core";
+export { availableBackends, registry, select } from "./registry.js";

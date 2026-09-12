@@ -9,8 +9,19 @@
  * PiSdkAgent throws a clear error.
  */
 
-import type { Agent, AgentEvent, AgentResponse, ModelInfo, PromptOptions, SessionInfo } from "@kagero/core";
-import { AgentError } from "@kagero/core";
+import type {
+  Agent,
+  AgentCapabilities,
+  AgentEvent,
+  AgentResponse,
+  HistoryOptions,
+  HistoryResult,
+  MidRunCommand,
+  ModelInfo,
+  PromptOptions,
+  SessionInfo,
+} from "@kagero/core";
+import { AgentError, unsupportedCapability } from "@kagero/core";
 
 // Type alias for the SDK's AgentSession — we don't import the module
 // statically so missing peer-dep doesn't break the build.
@@ -30,6 +41,19 @@ type SdkFactory = (opts?: unknown) => Promise<{ session: SdkSession }>;
 
 export class PiSdkAgent implements Agent {
   public readonly name = "pi-sdk";
+
+  public readonly capabilities: AgentCapabilities = {
+    resume: true,
+    models: true,
+    sessions: false,
+    history: false,
+    subscribe: true,
+    abort: true,
+    steer: true,
+    followUp: true,
+    limits: { timeout: false, maxTurns: false, maxToolCalls: false },
+    workspaceCreate: true,
+  };
 
   private session: SdkSession | null = null;
   private subscribers = new Map<string, Set<(e: AgentEvent) => void>>();
@@ -108,13 +132,13 @@ export class PiSdkAgent implements Agent {
     const session = this.requireSession();
     const start = Date.now();
     await session.prompt(prompt);
-    const out: AgentResponse = {
+    const m = session.getModel?.()?.id;
+    return {
+      status: "completed",
       text: this.collectText(),
       durationMs: Date.now() - start,
+      ...(m ? { modelId: m, modelSource: "reported" as const } : {}),
     };
-    const m = session.getModel?.()?.id;
-    if (m) out.modelId = m;
-    return out;
   }
 
   async resume(sessionId: string, prompt: string, _opts: PromptOptions = {}): Promise<AgentResponse> {
@@ -123,14 +147,14 @@ export class PiSdkAgent implements Agent {
     const start = Date.now();
     // The pi SDK doesn't have a clean "resume by id" — for now we use followUp
     await session.followUp(prompt);
-    const out: AgentResponse = {
+    const m = session.getModel?.()?.id;
+    return {
+      status: "completed",
       text: this.collectText(),
       sessionId,
       durationMs: Date.now() - start,
+      ...(m ? { modelId: m, modelSource: "reported" as const } : {}),
     };
-    const m = session.getModel?.()?.id;
-    if (m) out.modelId = m;
-    return out;
   }
 
   async listModels(): Promise<ModelInfo[]> {
@@ -167,6 +191,17 @@ export class PiSdkAgent implements Agent {
       set?.delete(onEvent);
       if (set && set.size === 0) this.subscribers.delete(sessionId);
     };
+  }
+
+  async send(sessionId: string, message: string, kind: MidRunCommand = "steer"): Promise<void> {
+    void sessionId;
+    const session = this.requireSession();
+    if (kind === "follow_up") await session.followUp(message);
+    else await session.steer(message);
+  }
+
+  async history(_sessionId: string, _opts?: HistoryOptions): Promise<HistoryResult> {
+    throw unsupportedCapability("history", "pi sessions live inside the SDK process in v0.2.");
   }
 
   async abort(_sessionId: string): Promise<void> {

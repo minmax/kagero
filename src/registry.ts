@@ -1,74 +1,38 @@
 /**
- * Registry — selects and instantiates a concrete Agent backend.
+ * Root composition — the backends kagero ships with.
  *
- * Backends are loaded lazily (only if the required peer-dep is installed).
+ * The pi backends live in @kagero/pi-backend; CLI wrappers are data-driven
+ * CliSpecs from @kagero/cli-backend and get registered here as they land
+ * (see docs/LIB-PLAN.md §6). Nothing else may hardcode backend names.
  */
 
-import type { Agent } from "@kagero/core";
-import { AgentError } from "@kagero/core";
+import { AgentError, createRegistry, type BackendRegistry } from "@kagero/core";
 
-export type BackendName = "pi-sdk" | "pi-rpc" | "dsh" | "qwen" | "grok" | "kimi" | "mcode";
+export const registry: BackendRegistry = createRegistry();
 
-/** Backend factories. Throws if required peer-dep is missing. */
-type BackendFactory = () => Agent | Promise<Agent>;
+registry.register("pi-sdk", async () => {
+  const mod = await import("@kagero/pi-backend");
+  return new mod.PiSdkAgent();
+});
 
-const factories: Record<BackendName, BackendFactory | undefined> = {
-  "pi-sdk": async () => {
-    try {
-      const mod = await import("@kagero/pi-backend");
-      return new mod.PiSdkAgent();
-    } catch (err) {
-      throw new AgentError(
-        "backend_unavailable",
-        `pi-sdk backend requires @earendil-works/pi-coding-agent. ${(err as Error).message}`,
-        "user",
-      );
-    }
-  },
-  "pi-rpc": async () => {
-    const mod = await import("@kagero/pi-backend");
-    return new mod.PiRpcAgent();
-  },
-  dsh: async () => {
-    const mod = await import("./backends/dsh.js");
-    return new mod.DshAgent();
-  },
-  qwen: async () => {
-    const mod = await import("./backends/qwen.js");
-    return new mod.QwenAgent();
-  },
-  grok: async () => {
-    const mod = await import("./backends/grok.js");
-    return new mod.GrokAgent();
-  },
-  kimi: async () => {
-    const mod = await import("./backends/kimi.js");
-    return new mod.KimiAgent();
-  },
-  mcode: async () => {
-    const mod = await import("./backends/mcode.js");
-    return new mod.McodeAgent();
-  },
-};
+registry.register("pi-rpc", async () => {
+  const mod = await import("@kagero/pi-backend");
+  return new mod.PiRpcAgent();
+});
 
-/**
- * Select a backend by name and instantiate it.
- *
- * @throws AgentError if the name is unknown or the backend can't be loaded.
- */
-export async function select(name: BackendName | string): Promise<Agent> {
-  const factory = factories[name as BackendName];
-  if (!factory) {
+/** Names of every registered backend, sorted. */
+export function availableBackends(): string[] {
+  return registry.names().sort();
+}
+
+/** Select a backend by name; unknown names are a user error. */
+export async function select(name: string) {
+  if (!registry.has(name)) {
     throw new AgentError(
       "unknown_backend",
-      `Unknown backend: ${name}. Available: ${Object.keys(factories).join(", ")}`,
+      `Unknown backend: ${name}. Available: ${availableBackends().join(", ")}`,
       "user",
     );
   }
-  return factory();
-}
-
-/** List available backend names. */
-export function availableBackends(): string[] {
-  return Object.keys(factories);
+  return registry.select(name);
 }

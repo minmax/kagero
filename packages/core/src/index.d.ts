@@ -3,6 +3,14 @@
  *
  * Zero runtime dependencies. Nothing in here knows about concrete backends.
  */
-export type { Agent, AgentEvent, AgentResponse, ModelInfo, PromptOptions, SessionInfo } from "./agent.js";
-export { AgentError } from "./agent.js";
+export type { Agent, AgentCapabilities, AgentEvent, AgentResponse, AgentRunStatus, HistoryEntry, HistoryOptions, HistoryResult, MidRunCommand, ModelInfo, PromptOptions, SessionInfo, UsageTelemetry, WorkspaceOption, } from "./agent.js";
+export { AgentError, unsupportedCapability } from "./agent.js";
+export { BackendRegistry, createRegistry } from "./registry.js";
+export type { BackendFactory } from "./registry.js";
+export { renderHistory, truncateForHistory } from "./history.js";
+export type { RenderHistoryOptions } from "./history.js";
+export { resolveBinary, runProcess } from "./process.js";
+export type { ResolvedBinary, RunOptions, RunResult, RunStatus } from "./process.js";
+export { resolveWorkspace } from "./workspace.js";
+export type { WorkspaceInfo } from "./workspace.js";
 //# sourceMappingURL=index.d.ts.map
