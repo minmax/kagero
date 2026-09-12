@@ -31,8 +31,10 @@
  * AbortController on print (the core stop ladder runs), in-protocol
  * session/cancel on ACP. No active run → no-op. Idempotent.
  *
- * send(sessionId, message, kind) needs a live ACP client for the session and
- * gates on capabilities.steer / capabilities.followUp; print-only specs get
+ * send(sessionId, message, kind) goes through the live ACP client for the
+ * session — clients stay in a session-keyed map after their run settles, so a
+ * follow-up can be queued right after a turn ends — and gates on
+ * capabilities.steer / capabilities.followUp; print-only specs get
  * unsupported_capability.
  *
  * listModels/listSessions run their spec command (probe budget, default 60s);
@@ -105,6 +107,8 @@ export class CliSpecAgent implements Agent {
 
   private readonly defaults: CliSpecAgentOptions;
   private readonly activeRuns = new Map<string, RunHandle>();
+  /** Live ACP clients by session id — they outlive the run that opened them. */
+  private readonly acpClients = new Map<string, AcpClient>();
   private readonly listeners = new Map<string, Set<(e: AgentEvent) => void>>();
   private disposed = false;
 
@@ -216,18 +220,19 @@ export class CliSpecAgent implements Agent {
     }
 
     if (run.status === "exit-error" || run.status === "spawn-failed") {
+      const head = stderrHead(run.stderr);
       const detail =
         run.status === "spawn-failed"
           ? `failed to spawn ${this.spec.binary}`
           : `${this.spec.binary} exited with code ${String(run.exitCode)}${run.signal === null ? "" : ` (signal ${run.signal})`}`;
       throw new AgentError(
         run.status === "spawn-failed" ? "spawn_failed" : "cli_error",
-        detail,
+        head === "" ? detail : `${detail}: ${head}`,
         "tool",
         {
           exitCode: run.exitCode,
           signal: run.signal,
-          stderrHead: stderrHead(run.stderr),
+          stderrHead: head,
           binary: this.spec.binary,
         },
       );
@@ -238,14 +243,11 @@ export class CliSpecAgent implements Agent {
     if (parsed.sessionId !== undefined) this.emitSessionStart(handle, parsed.sessionId);
 
     const modelId = parsed.modelId ?? ctx.opts.modelId;
+    const responseSessionId = parsed.sessionId ?? ctx.sessionId ?? ctx.runSessionId;
     return {
       status: run.status === "aborted" ? "aborted" : run.status === "timed-out" ? "timed-out" : "completed",
       text: parsed.text,
-      ...(parsed.sessionId === undefined
-        ? ctx.sessionId === undefined
-          ? {}
-          : { sessionId: ctx.sessionId }
-        : { sessionId: parsed.sessionId }),
+      ...(responseSessionId === undefined ? {} : { sessionId: responseSessionId }),
       ...(modelId === undefined
         ? {}
         : {
@@ -346,6 +348,7 @@ export class CliSpecAgent implements Agent {
     if (sessionId === null) {
       throw new AgentError("cli_error", `${this.spec.name} ACP session did not open`, "tool", {});
     }
+    this.trackClient(sessionId, client);
     this.emitSessionStart(handle, sessionId);
     client.abortWith(handle.controller.signal);
 
@@ -472,17 +475,20 @@ export class CliSpecAgent implements Agent {
     if (kind === "steer" && !this.capabilities.steer) throw unsupportedCapability("steer");
     if (kind === "follow_up" && !this.capabilities.followUp) throw unsupportedCapability("followUp");
 
-    const handle = this.findBySession(sessionId);
-    if (handle === null || handle.client === null) {
+    // The live client outlives its run (follow-up right after a settled
+    // turn); an in-flight run whose session has not opened yet is reachable
+    // through its handle.
+    const client = this.acpClients.get(sessionId) ?? this.findBySession(sessionId)?.client ?? null;
+    if (client === null) {
       throw unsupportedCapability(
         kind === "steer" ? "steer" : "followUp",
-        `no live ACP session for "${sessionId}" — mid-run messages need an in-flight ACP run.`,
+        `no live ACP session for "${sessionId}" — mid-run messages need an ACP run.`,
       );
     }
     if (kind === "steer") {
-      handle.client.steer(message);
+      client.steer(message);
     } else {
-      handle.client.followUp(message);
+      client.followUp(message);
     }
   }
 
@@ -502,9 +508,12 @@ export class CliSpecAgent implements Agent {
     const stops: Promise<unknown>[] = [];
     for (const handle of [...this.activeRuns.values()]) {
       handle.controller.abort();
-      if (handle.client !== null) stops.push(handle.client.dispose());
+    }
+    for (const client of [...this.acpClients.values()]) {
+      stops.push(client.dispose());
     }
     this.activeRuns.clear();
+    this.acpClients.clear();
     await Promise.allSettled(stops);
     this.listeners.clear();
   }
@@ -522,6 +531,17 @@ export class CliSpecAgent implements Agent {
       if (handle.sessionIds.has(sessionId)) return handle;
     }
     return null;
+  }
+
+  /** Remember a live ACP client per session id; a replaced client is disposed. */
+  private trackClient(sessionId: string, client: AcpClient): void {
+    const previous = this.acpClients.get(sessionId);
+    if (previous !== undefined && previous !== client) {
+      void previous.dispose().catch(() => {
+        // A dead previous client is fine — it is being replaced.
+      });
+    }
+    this.acpClients.set(sessionId, client);
   }
 
   private emit(handle: RunHandle, draft: AgentEventDraft): void {

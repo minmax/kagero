@@ -101,7 +101,13 @@ const mcodeSpec: CliSpec = {
         const providerId = typeof provider.providerId === "string" ? provider.providerId : "unknown";
         if (!Array.isArray(provider.models)) continue;
         for (const rawModel of provider.models) {
-          const modelId = typeof rawModel === "string" ? rawModel : undefined;
+          // Entries are plain ids or {modelId, selected} records.
+          const modelId =
+            typeof rawModel === "string"
+              ? rawModel
+              : typeof (rawModel as { modelId?: unknown } | null)?.modelId === "string"
+                ? (rawModel as { modelId: string }).modelId
+                : undefined;
           if (modelId === undefined) continue;
           const id = `${providerId}/${modelId}`;
           infos.push({
