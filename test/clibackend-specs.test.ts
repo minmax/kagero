@@ -27,13 +27,15 @@ const ctx = (overrides: Partial<PromptContext> & { prompt: string }): PromptCont
 });
 
 describe("deriveCapabilities — honest defaults per built-in spec", () => {
-  it("dsh: print-only, no resume/models/sessions/history, wrapper timeout", () => {
+  it("dsh: print-only, no resume/models, on-disk sessions/history, wrapper timeout", () => {
     const caps = deriveCapabilities(dshSpec);
     expect(caps).toMatchObject({
       resume: false,
       models: false,
-      sessions: false,
-      history: false,
+      // Sessions/history come from the on-disk readers (projcache projection +
+      // multi-frame zstd logs) — the CLI itself exposes neither.
+      sessions: true,
+      history: true,
       abort: true,
       steer: false,
       followUp: false,
