@@ -3,12 +3,7 @@
   "compilerOptions": {
     "noEmit": false,
     "outDir": "dist",
-    "rootDir": "src",
-    "baseUrl": ".",
-    "paths": {
-      "@kagero/core": ["packages/core/src/index.ts"],
-      "@kagero/pi-backend": ["packages/pi-backend/src/index.ts"]
-    }
+    "rootDir": "src"
   },
   "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist"]
