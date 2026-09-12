@@ -13,6 +13,8 @@ export type { ClaudeLineageOptions, ClaudeLineageUsageStyle } from "./parse/clau
 export { claudeLineageStream, parseClaudeLineage } from "./parse/claude-lineage.js";
 export type { CodexJsonlOptions } from "./parse/codex-jsonl.js";
 export { codexJsonlStream, parseCodexJsonl } from "./parse/codex-jsonl.js";
+export type { KimiRolesOptions } from "./parse/kimi-roles.js";
+export { kimiRolesStream, parseKimiRoles } from "./parse/kimi-roles.js";
 export { convertExecLine, mcodeExecStream, parseMcodeExec } from "./parse/mcode-exec.js";
 export type {
   AcpConfigOption,

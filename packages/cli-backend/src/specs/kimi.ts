@@ -7,7 +7,12 @@
  *    `-p` is greedy and must come last; `-y`/`--auto`/`--plan` are omitted on
  *    purpose — the CLI rejects them with `-p`, and prompt mode already
  *    executes tools without confirmation. Kimi names fresh sessions itself;
- *    only resumes pass an id.
+ *    only resumes pass an id. The print stream is NDJSON ROLE-LINES
+ *    ({"role":"meta"|"assistant"|"tool", …}) — NOT the claude-lineage
+ *    envelope family: no `type`-tagged envelopes, no result envelope, the
+ *    last assistant `content` string is the answer, and the session id lives
+ *    on the `meta` `session.resume_hint` line. Parsed by parseKimiRoles
+ *    (parse/kimi-roles.ts).
  *  - ACP: `kimi acp`, initialize protocolVersion is the integer 1,
  *    session/set_mode carries the approval mode (their set_mode semantics —
  *    qwen-mcp defaulted unset runs to "yolo"; here "default" leaves the CLI's
@@ -22,7 +27,7 @@
 
 import type { ModelInfo } from "@kagero/core";
 import { createKimiHistoryReader } from "../history-readers/kimi.js";
-import { parseClaudeLineage } from "../parse/claude-lineage.js";
+import { parseKimiRoles } from "../parse/kimi-roles.js";
 import type { CliSpec, PromptContext } from "../spec.js";
 
 const kimiSpec: CliSpec = {
@@ -45,7 +50,7 @@ const kimiSpec: CliSpec = {
       args.push("-p", ctx.prompt);
       return args;
     },
-    parse: (stdout) => parseClaudeLineage(stdout, { usageStyle: "grok" }),
+    parse: (stdout) => parseKimiRoles(stdout),
   },
 
   acp: {
