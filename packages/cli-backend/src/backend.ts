@@ -316,6 +316,7 @@ export class CliSpecAgent implements Agent {
     const client = new AcpClient({
       command: [binary.path, ...acp.args, ...(acp.extraArgs?.(ctx) ?? [])],
       cwd: ctx.workspace,
+      protocolVersion: acp.protocolVersion,
       onEvent: (event, sessionId) => {
         const route = sessionId !== "" ? sessionId : handle.key;
         if (sessionId !== "") handle.sessionIds.add(sessionId);
