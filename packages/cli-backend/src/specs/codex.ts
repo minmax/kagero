@@ -35,7 +35,9 @@ const codexSpec: CliSpec = {
       const modelArgs = ctx.opts.modelId === undefined ? [] : ["--model", ctx.opts.modelId];
       if (ctx.mode === "resume" && ctx.sessionId !== undefined) {
         // resume has no -C/-s: cwd and sandbox are inherited from the session.
-        return ["exec", "resume", ctx.sessionId, ...modelArgs, ctx.prompt];
+        // --json must ride along: without it the resume run prints human text
+        // and the JSONL parser would find nothing.
+        return ["exec", "resume", ctx.sessionId, "--json", ...modelArgs, ctx.prompt];
       }
       return [
         "exec",
