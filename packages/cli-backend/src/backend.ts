@@ -46,7 +46,6 @@
  */
 
 import { randomUUID } from "node:crypto";
-
 import type {
   Agent,
   AgentCapabilities,
@@ -57,14 +56,14 @@ import type {
   MidRunCommand,
   ModelInfo,
   PromptOptions,
+  RunResult,
   SessionInfo,
 } from "@kagero/core";
-import { AgentError, runProcess, resolveBinary, resolveWorkspace, unsupportedCapability } from "@kagero/core";
-import type { RunResult } from "@kagero/core";
+import { AgentError, resolveBinary, resolveWorkspace, runProcess, unsupportedCapability } from "@kagero/core";
+import type { AcpSessionConfig } from "../../core/src/acp.js";
 // AcpClient / AcpSessionConfig are not (yet) re-exported from the @kagero/core
 // barrel; the core suite imports them the same way (test/core-acp.test.ts).
 import { AcpClient } from "../../core/src/acp.js";
-import type { AcpSessionConfig } from "../../core/src/acp.js";
 import type { CliSpec, ParsedRun, PrintParser, PromptContext } from "./spec.js";
 import { defaultBinaryEnvVar, deriveCapabilities } from "./spec.js";
 
@@ -127,7 +126,10 @@ export class CliSpecAgent implements Agent {
 
   async resume(sessionId: string, prompt: string, opts: PromptOptions = {}): Promise<AgentResponse> {
     if (!this.capabilities.resume) {
-      throw unsupportedCapability("resume", `${this.name} cannot continue a session; run a fresh prompt instead.`);
+      throw unsupportedCapability(
+        "resume",
+        `${this.name} cannot continue a session; run a fresh prompt instead.`,
+      );
     }
     return this.runPrompt(prompt, { ...opts, sessionId }, "resume");
   }
@@ -178,7 +180,12 @@ export class CliSpecAgent implements Agent {
 
       this.emit(handle, {
         type: "session-end",
-        reason: response.status === "completed" ? "completed" : response.status === "aborted" ? "killed" : "timed-out",
+        reason:
+          response.status === "completed"
+            ? "completed"
+            : response.status === "aborted"
+              ? "killed"
+              : "timed-out",
       });
       return response;
     } catch (err) {
@@ -196,7 +203,10 @@ export class CliSpecAgent implements Agent {
     if (print === undefined) {
       throw unsupportedCapability("prompting", `spec "${this.spec.name}" declares no print transport.`);
     }
-    const binary = resolveBinary(this.spec.binary, this.spec.binaryEnvVar ?? defaultBinaryEnvVar(this.spec.name));
+    const binary = resolveBinary(
+      this.spec.binary,
+      this.spec.binaryEnvVar ?? defaultBinaryEnvVar(this.spec.name),
+    );
     const timeoutMs = ctx.opts.timeoutMs ?? this.defaults.timeoutMs;
     const args = print.args(ctx);
 
@@ -205,7 +215,9 @@ export class CliSpecAgent implements Agent {
       run = await runProcess(binary.path, args, {
         cwd: ctx.workspace,
         ...(timeoutMs === undefined ? {} : { timeoutMs }),
-        ...(this.defaults.maxOutputBytes === undefined ? {} : { maxOutputBytes: this.defaults.maxOutputBytes }),
+        ...(this.defaults.maxOutputBytes === undefined
+          ? {}
+          : { maxOutputBytes: this.defaults.maxOutputBytes }),
         signal: handle.controller.signal,
         ...(ctx.opts.onStream === undefined ? {} : { onStdoutChunk: ctx.opts.onStream }),
       });
@@ -293,7 +305,10 @@ export class CliSpecAgent implements Agent {
     if (acp === undefined) {
       throw unsupportedCapability("prompting", `spec "${this.spec.name}" declares no ACP transport.`);
     }
-    const binary = resolveBinary(this.spec.binary, this.spec.binaryEnvVar ?? defaultBinaryEnvVar(this.spec.name));
+    const binary = resolveBinary(
+      this.spec.binary,
+      this.spec.binaryEnvVar ?? defaultBinaryEnvVar(this.spec.name),
+    );
     const client = new AcpClient({
       command: [binary.path, ...acp.args, ...(acp.extraArgs?.(ctx) ?? [])],
       cwd: ctx.workspace,
@@ -311,12 +326,9 @@ export class CliSpecAgent implements Agent {
       await client.start();
       await client.initialize();
     } catch (err) {
-      throw new AgentError(
-        "spawn_failed",
-        err instanceof Error ? err.message : String(err),
-        "tool",
-        { binary: this.spec.binary },
-      );
+      throw new AgentError("spawn_failed", err instanceof Error ? err.message : String(err), "tool", {
+        binary: this.spec.binary,
+      });
     }
 
     const meta = acp.sessionMeta?.(ctx);
@@ -403,7 +415,10 @@ export class CliSpecAgent implements Agent {
     this.assertNotDisposed();
     const models = this.spec.models;
     if (models === undefined) {
-      throw unsupportedCapability("model listing", `${this.name} exposes no model listing command; set models in the spec.`);
+      throw unsupportedCapability(
+        "model listing",
+        `${this.name} exposes no model listing command; set models in the spec.`,
+      );
     }
     const result = await this.runProbe(models.args());
     if (result.status !== "completed") {
@@ -438,13 +453,19 @@ export class CliSpecAgent implements Agent {
     this.assertNotDisposed();
     const history = this.spec.history;
     if (history === undefined) {
-      throw unsupportedCapability("history", `${this.name} has no on-disk history reader; set history in the spec.`);
+      throw unsupportedCapability(
+        "history",
+        `${this.name} has no on-disk history reader; set history in the spec.`,
+      );
     }
     return history.read(sessionId, opts);
   }
 
   private async runProbe(args: readonly string[]): Promise<RunResult> {
-    const binary = resolveBinary(this.spec.binary, this.spec.binaryEnvVar ?? defaultBinaryEnvVar(this.spec.name));
+    const binary = resolveBinary(
+      this.spec.binary,
+      this.spec.binaryEnvVar ?? defaultBinaryEnvVar(this.spec.name),
+    );
     return runProcess(binary.path, args, {
       timeoutMs: this.defaults.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS,
       ...(this.defaults.maxOutputBytes === undefined ? {} : { maxOutputBytes: this.defaults.maxOutputBytes }),

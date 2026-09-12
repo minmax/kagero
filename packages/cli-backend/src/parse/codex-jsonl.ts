@@ -18,8 +18,8 @@
  * backend measures it. Without a `turn.completed` the run is `partial: true`.
  */
 
-import { AgentError } from "@kagero/core";
 import type { UsageTelemetry } from "@kagero/core";
+import { AgentError } from "@kagero/core";
 import type { ParsedRun } from "../spec.js";
 
 type RpcRecord = Record<string, unknown>;

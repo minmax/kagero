@@ -4,12 +4,11 @@ import { chmodSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
-
+import type { CliSpec, PrintTransport } from "@kagero/cli-backend";
+import { CliSpecAgent } from "@kagero/cli-backend";
 import type { AgentEvent, AgentResponse } from "@kagero/core";
 import { AgentError } from "@kagero/core";
-import { CliSpecAgent } from "@kagero/cli-backend";
-import type { CliSpec, PrintTransport } from "@kagero/cli-backend";
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseClaudeLineage } from "../packages/cli-backend/src/parse/claude-lineage.js";
 
 const FAKE_CLI = fileURLToPath(new URL("./helpers/fake-cli.mjs", import.meta.url));
@@ -118,9 +117,14 @@ afterAll(() => {
 
 describe("CliSpecAgent — print transport", () => {
   it("resolves a happy path: text, sessionId, reported model, usage, workspace echo", async () => {
-    const agent = new CliSpecAgent(fakePrintSpec({}, {
-      args: (ctx) => [FAKE_CLI, "--session-id", "sess-known", ctx.prompt],
-    }));
+    const agent = new CliSpecAgent(
+      fakePrintSpec(
+        {},
+        {
+          args: (ctx) => [FAKE_CLI, "--session-id", "sess-known", ctx.prompt],
+        },
+      ),
+    );
     const response = await agent.prompt("Say FAKE-ANSWER", {
       modelId: "fake-super-model",
       workspace: { path: workspaceDir },
@@ -155,16 +159,23 @@ describe("CliSpecAgent — print transport", () => {
 
   it("builds resume argv with the resume flag and the session id", async () => {
     await withEnv({ FAKE_CLI_ARGV_LOG: argvLog }, async () => {
-      const agent = new CliSpecAgent(fakePrintSpec({}, {
-        args: (ctx) => {
-          const resume = ctx.mode === "resume" && ctx.sessionId !== undefined;
-          return [
-            FAKE_CLI,
-            ...(resume ? ["--resume", ctx.sessionId as string] : ["--session-id", ctx.runSessionId ?? "x"]),
-            ctx.prompt,
-          ];
-        },
-      }));
+      const agent = new CliSpecAgent(
+        fakePrintSpec(
+          {},
+          {
+            args: (ctx) => {
+              const resume = ctx.mode === "resume" && ctx.sessionId !== undefined;
+              return [
+                FAKE_CLI,
+                ...(resume
+                  ? ["--resume", ctx.sessionId as string]
+                  : ["--session-id", ctx.runSessionId ?? "x"]),
+                ctx.prompt,
+              ];
+            },
+          },
+        ),
+      );
       const response = await agent.resume("sess-42", "continue", { workspace: { path: workspaceDir } });
       expect(response.sessionId).toBe("sess-42");
       const call = readArgvLog(argvLog).at(-1);
@@ -177,9 +188,14 @@ describe("CliSpecAgent — print transport", () => {
   });
 
   it("maps a deadline to status timed-out with meta.partial", async () => {
-    const agent = new CliSpecAgent(fakePrintSpec({}, {
-      args: (ctx) => [FAKE_CLI, ctx.prompt],
-    }));
+    const agent = new CliSpecAgent(
+      fakePrintSpec(
+        {},
+        {
+          args: (ctx) => [FAKE_CLI, ctx.prompt],
+        },
+      ),
+    );
     await withEnv({ FAKE_CLI_MODE: "sleep", FAKE_CLI_SLEEP_MS: "5000" }, async () => {
       const response = await agent.prompt("slow", { timeoutMs: 300 });
       expect(response.status).toBe("timed-out");
@@ -189,9 +205,12 @@ describe("CliSpecAgent — print transport", () => {
 
   it("maps abort() to status aborted (upfront session id)", async () => {
     const agent = new CliSpecAgent(
-      fakePrintSpec({ newSessionId: () => "sess-abort-me" }, {
-        args: (ctx) => [FAKE_CLI, "--session-id", ctx.runSessionId ?? "?", ctx.prompt],
-      }),
+      fakePrintSpec(
+        { newSessionId: () => "sess-abort-me" },
+        {
+          args: (ctx) => [FAKE_CLI, "--session-id", ctx.runSessionId ?? "?", ctx.prompt],
+        },
+      ),
     );
     await withEnv({ FAKE_CLI_MODE: "sleep", FAKE_CLI_SLEEP_MS: "5000" }, async () => {
       const pending = guard(agent.prompt("abort me"));
@@ -265,9 +284,14 @@ describe("CliSpecAgent — print transport", () => {
   });
 
   it("emits user-prompt, session-start and session-end around a run", async () => {
-    const agent = new CliSpecAgent(fakePrintSpec({}, {
-      args: (ctx) => [FAKE_CLI, "--session-id", "sess-events", ctx.prompt],
-    }));
+    const agent = new CliSpecAgent(
+      fakePrintSpec(
+        {},
+        {
+          args: (ctx) => [FAKE_CLI, "--session-id", "sess-events", ctx.prompt],
+        },
+      ),
+    );
     const { events, unsubscribe } = collectEvents(agent);
     await agent.prompt("hi", { workspace: { path: workspaceDir } });
     unsubscribe();
@@ -343,7 +367,9 @@ describe("CliSpecAgent — ACP transport", () => {
       await agent.prompt("first");
       await agent.send("sess-fake-1", "and then", "follow_up");
       await new Promise((resolve) => setTimeout(resolve, 100));
-      const lines = readFileSync(log, "utf8").split("\n").filter((line) => line !== "");
+      const lines = readFileSync(log, "utf8")
+        .split("\n")
+        .filter((line) => line !== "");
       const followUp = lines
         .map((line) => JSON.parse(line) as { method?: string; text?: string; notification?: boolean })
         .find((e) => e.method === "session/prompt" && e.notification === true);
@@ -394,7 +420,16 @@ describe("CliSpecAgent — discovery and lifecycle", () => {
       fakePrintSpec({
         models: {
           args: () => [FAKE_CLI],
-          parse: () => [{ id: "m1", displayName: "m1", provider: "fake", contextWindow: 0, supportsTools: false, supportsVision: false }],
+          parse: () => [
+            {
+              id: "m1",
+              displayName: "m1",
+              provider: "fake",
+              contextWindow: 0,
+              supportsTools: false,
+              supportsVision: false,
+            },
+          ],
         },
       }),
     );
@@ -447,8 +482,18 @@ describe("print parse bridge", () => {
   it("parses a fake claude stream through the lineage parser", () => {
     const stdout = [
       JSON.stringify({ type: "system", subtype: "init", session_id: "s1", model: "m" }),
-      JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "hi" }] } }),
-      JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "hi", session_id: "s1", usage: { input_tokens: 1 } }),
+      JSON.stringify({
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: "hi" }] },
+      }),
+      JSON.stringify({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: "hi",
+        session_id: "s1",
+        usage: { input_tokens: 1 },
+      }),
       "",
     ].join("\n");
     const parsed = parseClaudeLineage(stdout, { usageStyle: "claude" });

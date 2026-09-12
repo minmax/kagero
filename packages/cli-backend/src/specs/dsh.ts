@@ -37,7 +37,7 @@ const dshSpec: CliSpec = {
         // dsh has no model flag; selection lives in settings.yaml / --patch.
         throw unsupportedCapability(
           "model selection",
-          'dsh headless has no --model flag. Set agent-default-model in ~/.dsh/settings.yaml or pass a `--patch` overlay.',
+          "dsh headless has no --model flag. Set agent-default-model in ~/.dsh/settings.yaml or pass a `--patch` overlay.",
         );
       }
       return ["--profile", "headless", ctx.prompt];

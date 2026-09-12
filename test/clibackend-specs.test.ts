@@ -4,22 +4,20 @@
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
-
-import { AgentError } from "@kagero/core";
-import { deriveCapabilities } from "@kagero/cli-backend";
 import type { PromptContext } from "@kagero/cli-backend";
+import { deriveCapabilities } from "@kagero/cli-backend";
+import { AgentError } from "@kagero/core";
+import { describe, expect, it } from "vitest";
+import { parseClaudeLineage } from "../packages/cli-backend/src/parse/claude-lineage.js";
+import { parseCodexJsonl } from "../packages/cli-backend/src/parse/codex-jsonl.js";
+import { parseMcodeExec } from "../packages/cli-backend/src/parse/mcode-exec.js";
 import claudeSpec from "../packages/cli-backend/src/specs/claude.js";
 import codexSpec from "../packages/cli-backend/src/specs/codex.js";
 import dshSpec from "../packages/cli-backend/src/specs/dsh.js";
 import grokSpec from "../packages/cli-backend/src/specs/grok.js";
 import kimiSpec from "../packages/cli-backend/src/specs/kimi.js";
 import mcodeSpec from "../packages/cli-backend/src/specs/mcode.js";
-import { qwenPromptArg } from "../packages/cli-backend/src/specs/qwen.js";
-import qwenSpec from "../packages/cli-backend/src/specs/qwen.js";
-import { parseClaudeLineage } from "../packages/cli-backend/src/parse/claude-lineage.js";
-import { parseCodexJsonl } from "../packages/cli-backend/src/parse/codex-jsonl.js";
-import { parseMcodeExec } from "../packages/cli-backend/src/parse/mcode-exec.js";
+import qwenSpec, { qwenPromptArg } from "../packages/cli-backend/src/specs/qwen.js";
 
 const ctx = (overrides: Partial<PromptContext> & { prompt: string }): PromptContext => ({
   opts: {},
@@ -157,9 +155,7 @@ describe("claude spec", () => {
   });
 
   it("resumes with --resume <id>", () => {
-    const args = claudeSpec.print?.args(
-      ctx({ prompt: "hi", mode: "resume", sessionId: "abc-123" }),
-    );
+    const args = claudeSpec.print?.args(ctx({ prompt: "hi", mode: "resume", sessionId: "abc-123" }));
     expect(args).toContain("--resume");
     expect(args).toContain("abc-123");
   });
@@ -201,9 +197,7 @@ describe("claude spec", () => {
 
 describe("codex spec", () => {
   it("builds fresh exec argv: --json --skip-git-repo-check, yolo bypass, prompt last", () => {
-    const args = codexSpec.print?.args(
-      ctx({ prompt: "say hi", opts: { approvalMode: "yolo" } }),
-    );
+    const args = codexSpec.print?.args(ctx({ prompt: "say hi", opts: { approvalMode: "yolo" } }));
     expect(args).toEqual([
       "exec",
       "--json",
@@ -230,11 +224,23 @@ describe("codex spec", () => {
       JSON.stringify({ type: "thread.started", thread_id: "thr-1" }),
       JSON.stringify({ type: "item.completed", item: { id: "item_0", type: "error", message: "noise" } }),
       JSON.stringify({ type: "turn.started" }),
-      JSON.stringify({ type: "item.completed", item: { id: "item_1", type: "agent_message", text: "first" } }),
-      JSON.stringify({ type: "item.completed", item: { id: "item_2", type: "agent_message", text: "final" } }),
+      JSON.stringify({
+        type: "item.completed",
+        item: { id: "item_1", type: "agent_message", text: "first" },
+      }),
+      JSON.stringify({
+        type: "item.completed",
+        item: { id: "item_2", type: "agent_message", text: "final" },
+      }),
       JSON.stringify({
         type: "turn.completed",
-        usage: { input_tokens: 20, cached_input_tokens: 5, cache_write_input_tokens: 2, output_tokens: 9, reasoning_output_tokens: 4 },
+        usage: {
+          input_tokens: 20,
+          cached_input_tokens: 5,
+          cache_write_input_tokens: 2,
+          output_tokens: 9,
+          reasoning_output_tokens: 4,
+        },
       }),
       "",
     ].join("\n");
@@ -330,9 +336,7 @@ describe("mcode spec", () => {
       "--",
       "do it",
     ]);
-    const resume = mcodeSpec.print?.args(
-      ctx({ prompt: "do it", mode: "resume", sessionId: "mc-1" }),
-    );
+    const resume = mcodeSpec.print?.args(ctx({ prompt: "do it", mode: "resume", sessionId: "mc-1" }));
     expect(resume).toEqual([
       "exec",
       "--output-format",
@@ -347,7 +351,9 @@ describe("mcode spec", () => {
   });
 
   it("maps approval to ACP permissionMode (yolo → bypassPermissions)", () => {
-    const options = mcodeSpec.acp?.configOptions?.(ctx({ prompt: "x", opts: { approvalMode: "yolo", modelId: "m" } }));
+    const options = mcodeSpec.acp?.configOptions?.(
+      ctx({ prompt: "x", opts: { approvalMode: "yolo", modelId: "m" } }),
+    );
     expect(options).toEqual([
       { configId: "permissionMode", value: "bypassPermissions" },
       { configId: "model", value: "m" },
@@ -359,7 +365,12 @@ describe("mcode spec", () => {
     const models = mcodeSpec.models?.parse(
       JSON.stringify({
         providers: [
-          { providerId: "minimax", name: "MiniMax", active: true, models: ["MiniMax-M3", { modelId: "M2.7", selected: true }] },
+          {
+            providerId: "minimax",
+            name: "MiniMax",
+            active: true,
+            models: ["MiniMax-M3", { modelId: "M2.7", selected: true }],
+          },
         ],
       }),
     );
@@ -455,7 +466,10 @@ describe("claude-lineage parser (shared fold)", () => {
   it("falls back to the last assistant text and marks partial without a result envelope", () => {
     const stdout = [
       JSON.stringify({ type: "system", subtype: "init", session_id: "s1", model: "m1" }),
-      JSON.stringify({ type: "assistant", message: { role: "assistant", model: "m2", content: [{ type: "text", text: "cut off" }] } }),
+      JSON.stringify({
+        type: "assistant",
+        message: { role: "assistant", model: "m2", content: [{ type: "text", text: "cut off" }] },
+      }),
       "",
     ].join("\n");
     const parsed = parseClaudeLineage(stdout, { usageStyle: "grok" });
@@ -466,15 +480,27 @@ describe("claude-lineage parser (shared fold)", () => {
 
   it("never takes the answer from user/tool_result lines", () => {
     const stdout = [
-      JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "tool_result", content: "NOT THE ANSWER" }] } }),
-      JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "answer", session_id: "s" }),
+      JSON.stringify({
+        type: "user",
+        message: { role: "user", content: [{ type: "tool_result", content: "NOT THE ANSWER" }] },
+      }),
+      JSON.stringify({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: "answer",
+        session_id: "s",
+      }),
     ].join("\n");
     expect(parseClaudeLineage(stdout).text).toBe("answer");
   });
 
   it("reads modelUsage only when it names a single model, else the last assistant model", () => {
     const multi = [
-      JSON.stringify({ type: "assistant", message: { role: "assistant", model: "assistant-model", content: [] } }),
+      JSON.stringify({
+        type: "assistant",
+        message: { role: "assistant", model: "assistant-model", content: [] },
+      }),
       JSON.stringify({
         type: "result",
         is_error: false,
@@ -496,10 +522,20 @@ describe("claude-lineage parser (shared fold)", () => {
 
   it("understands the pi usage style (nested) with flat fallback", () => {
     const nested = parseClaudeLineage(
-      JSON.stringify({ type: "result", is_error: false, result: "t", usage: { input: { tokens: 10, cacheRead: 4, cacheWrite: 2 }, output: { tokens: 3 } } }),
+      JSON.stringify({
+        type: "result",
+        is_error: false,
+        result: "t",
+        usage: { input: { tokens: 10, cacheRead: 4, cacheWrite: 2 }, output: { tokens: 3 } },
+      }),
       { usageStyle: "pi" },
     );
-    expect(nested.usage).toEqual({ inputTokens: 10, outputTokens: 3, cacheReadTokens: 4, cacheWriteTokens: 2 });
+    expect(nested.usage).toEqual({
+      inputTokens: 10,
+      outputTokens: 3,
+      cacheReadTokens: 4,
+      cacheWriteTokens: 2,
+    });
     const flat = parseClaudeLineage(
       JSON.stringify({ type: "result", is_error: false, result: "t", usage: { input_tokens: 7 } }),
       { usageStyle: "pi" },
@@ -509,7 +545,11 @@ describe("claude-lineage parser (shared fold)", () => {
 
   it("skips non-JSON stdout noise", () => {
     const parsed = parseClaudeLineage(
-      ['[claude-code:unrecognized_model] {"model":"x"}', JSON.stringify({ type: "result", is_error: false, result: "ok", session_id: "s" }), ""].join("\n"),
+      [
+        '[claude-code:unrecognized_model] {"model":"x"}',
+        JSON.stringify({ type: "result", is_error: false, result: "ok", session_id: "s" }),
+        "",
+      ].join("\n"),
     );
     expect(parsed.text).toBe("ok");
   });

@@ -21,9 +21,9 @@
  * failed/timeout/cancelled → error (AgentError via the shared is_error path).
  */
 
-import { claudeLineageStream } from "./claude-lineage.js";
-import type { ClaudeLineageOptions } from "./claude-lineage.js";
 import type { ParsedRun } from "../spec.js";
+import type { ClaudeLineageOptions } from "./claude-lineage.js";
+import { claudeLineageStream } from "./claude-lineage.js";
 
 type RpcRecord = Record<string, unknown>;
 
@@ -88,7 +88,11 @@ export function convertExecLine(raw: string): RpcRecord | null {
   return null;
 }
 
-function convertItem(item: RpcRecord | null, sessionId: string | undefined, completed: boolean): RpcRecord | null {
+function convertItem(
+  item: RpcRecord | null,
+  sessionId: string | undefined,
+  completed: boolean,
+): RpcRecord | null {
   if (item === null) return null;
 
   if (item["type"] === "agent_message") {
@@ -104,8 +108,7 @@ function convertItem(item: RpcRecord | null, sessionId: string | undefined, comp
 
   if (item["type"] === "tool_call") {
     const call = asRecord(item["toolCall"]) ?? item;
-    const name =
-      asString(call["toolName"]) ?? asString(call["name"]) ?? asString(call["title"]) ?? "tool";
+    const name = asString(call["toolName"]) ?? asString(call["name"]) ?? asString(call["title"]) ?? "tool";
     const input = asRecord(call["rawInput"]) ?? asRecord(call["input"]) ?? {};
     return {
       type: "assistant",

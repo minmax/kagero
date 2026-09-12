@@ -13,10 +13,10 @@ import type {
   HistoryResult,
   ModelInfo,
   PromptOptions,
+  RunResult,
   SessionInfo,
   UsageTelemetry,
 } from "@kagero/core";
-import type { RunResult } from "@kagero/core";
 
 /** Everything a print transport needs to know about one call. */
 export interface PromptContext {
@@ -142,8 +142,7 @@ export interface CliSpec {
 export function deriveCapabilities(spec: CliSpec): AgentCapabilities {
   const overrides = spec.capabilities;
   return {
-    resume:
-      overrides?.resume ?? (spec.print?.resumeCapable === true || spec.acp !== undefined),
+    resume: overrides?.resume ?? (spec.print?.resumeCapable === true || spec.acp !== undefined),
     models: overrides?.models ?? spec.models !== undefined,
     sessions: overrides?.sessions ?? spec.sessions !== undefined,
     history: overrides?.history ?? spec.history !== undefined,

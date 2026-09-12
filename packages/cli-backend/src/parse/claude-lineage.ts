@@ -40,8 +40,8 @@
  *    are fabricated.
  */
 
-import { AgentError } from "@kagero/core";
 import type { UsageTelemetry } from "@kagero/core";
+import { AgentError } from "@kagero/core";
 import type { ParsedRun } from "../spec.js";
 
 export type ClaudeLineageUsageStyle = "claude" | "pi" | "grok";
@@ -248,7 +248,9 @@ function answer(state: FoldState): ParsedRun {
     const resultText = asString(result["result"]) ?? asString(result["text"]);
     const error = asRecord(result["error"]);
     const errorMessage =
-      asString(error?.["message"]) ?? resultText ?? `CLI reported ${asString(result["subtype"]) ?? "an error"}`;
+      asString(error?.["message"]) ??
+      resultText ??
+      `CLI reported ${asString(result["subtype"]) ?? "an error"}`;
     if (isError) {
       throw new AgentError("cli_error", errorMessage, "tool", {
         subtype: asString(result["subtype"]),
@@ -291,9 +293,10 @@ function answer(state: FoldState): ParsedRun {
  * to streaming; the current CliSpecAgent forwards raw stdout chunks instead
  * (see backend.ts), so this is an export for callers that parse themselves.
  */
-export function claudeLineageStream(
-  opts: ClaudeLineageOptions & { readonly onText?: OnText } = {},
-): { pushLine(line: string): void; finish(): ParsedRun } {
+export function claudeLineageStream(opts: ClaudeLineageOptions & { readonly onText?: OnText } = {}): {
+  pushLine(line: string): void;
+  finish(): ParsedRun;
+} {
   const state: FoldState = {
     style: opts.usageStyle ?? "claude",
     onText: opts.onText,

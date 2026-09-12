@@ -27,8 +27,8 @@
 import { randomUUID } from "node:crypto";
 
 import { AgentError } from "@kagero/core";
-import { parseClaudeLineage } from "../parse/claude-lineage.js";
 import { createQwenHistoryReader } from "../history-readers/qwen.js";
+import { parseClaudeLineage } from "../parse/claude-lineage.js";
 import type { CliSpec, PromptContext } from "../spec.js";
 
 /** qwen-code acp-bridge REQUESTED_SESSION_ID_META_KEY (their acp.ts). */

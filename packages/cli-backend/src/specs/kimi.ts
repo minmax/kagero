@@ -21,8 +21,8 @@
  */
 
 import type { ModelInfo } from "@kagero/core";
-import { parseClaudeLineage } from "../parse/claude-lineage.js";
 import { createKimiHistoryReader } from "../history-readers/kimi.js";
+import { parseClaudeLineage } from "../parse/claude-lineage.js";
 import type { CliSpec, PromptContext } from "../spec.js";
 
 const kimiSpec: CliSpec = {

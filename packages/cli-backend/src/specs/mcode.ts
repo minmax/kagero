@@ -20,8 +20,8 @@
  */
 
 import type { ModelInfo } from "@kagero/core";
-import { parseMcodeExec } from "../parse/mcode-exec.js";
 import { createMcodeHistoryReader } from "../history-readers/mcode.js";
+import { parseMcodeExec } from "../parse/mcode-exec.js";
 import type { AcpConfigOption, CliSpec, PromptContext } from "../spec.js";
 
 /** ACP `permissionMode` config values (their acpPermissionMode). */
