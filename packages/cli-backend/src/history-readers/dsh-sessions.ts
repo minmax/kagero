@@ -73,13 +73,7 @@ async function readRecord(file: string, id: string): Promise<SessionInfo | undef
 
 /** List dsh sessions from the projcache projection, newest first. */
 export async function readDshSessions(opts?: { readonly homeDir?: string }): Promise<SessionInfo[]> {
-  const sessionsDir = path.join(
-    homeRoot(opts),
-    ".dsh",
-    "storages",
-    "session_projcache",
-    "sessions",
-  );
+  const sessionsDir = path.join(homeRoot(opts), ".dsh", "storages", "session_projcache", "sessions");
   const found: SessionInfo[] = [];
   for (const dirent of await listDirectory(sessionsDir)) {
     if (!dirent.isFile()) continue;
