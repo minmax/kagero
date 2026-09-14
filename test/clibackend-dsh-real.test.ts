@@ -1,7 +1,7 @@
 // Tests for the dsh backend against the REAL DeepSeek Harness interface
 // (reviews/dsh-real-interface.md; dsh 0.1.5-rc.1, probed live 2026-09-12) plus
 // the dsh-headless-bridge plugin contract (repo
-// https://github.com/minmax/dsh-bridge — README.md, src/args.ts,
+// dsh-headless-bridge repo (see specs/dsh.ts BRIDGE_REPO) — README.md, src/args.ts,
 // src/output.ts). No real dsh is spawned: argv shape and parse are pure
 // functions, the readers run on throw-away HOME fixtures, and the process
 // paths use fake binaries through DSH_BIN.

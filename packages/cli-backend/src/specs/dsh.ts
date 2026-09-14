@@ -54,7 +54,8 @@ import { AgentError } from "@kagero/core";
 import { createDshHistoryReader, readDshSessions } from "../history-readers/index.js";
 import type { CliSpec, PrintParser, PromptContext } from "../spec.js";
 
-const BRIDGE_REPO = "https://github.com/minmax/dsh-bridge";
+/** dsh-headless-bridge install source; override for local checkouts. */
+const BRIDGE_REPO = process.env["KAGERO_DSH_BRIDGE_REPO"] ?? "https://github.com/minmax/dsh-bridge";
 const BRIDGE_HINT =
   `install dsh-headless-bridge into the headless profile ` +
   `(dsh plugin --profile headless add file:${BRIDGE_REPO}; repo: ${BRIDGE_REPO})`;
