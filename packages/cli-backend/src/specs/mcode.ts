@@ -20,7 +20,7 @@
  */
 
 import type { ModelInfo } from "@kagero/core";
-import { createMcodeHistoryReader } from "../history-readers/mcode.js";
+import { createMcodeHistoryReader } from "../history-readers/index.js";
 import { parseMcodeExec } from "../parse/mcode-exec.js";
 import type { AcpConfigOption, CliSpec, PromptContext } from "../spec.js";
 
@@ -69,6 +69,9 @@ const mcodeSpec: CliSpec = {
   acp: {
     args: ["acp"],
     protocolVersion: 1,
+    // mcode maps any other request_permission optionId to DENY
+    // (run-acp-command chunk: allow-once → allowOnce, else deny).
+    permissionOptions: { once: "allow-once", always: "allow-always" },
     configOptions: (ctx): AcpConfigOption[] => {
       const options: AcpConfigOption[] = [];
       const permissionMode = mcodeAcpPermissionMode(ctx.opts.approvalMode);

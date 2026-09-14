@@ -27,7 +27,7 @@
 import { randomUUID } from "node:crypto";
 
 import { AgentError } from "@kagero/core";
-import { createQwenHistoryReader } from "../history-readers/qwen.js";
+import { createQwenHistoryReader } from "../history-readers/index.js";
 import { parseClaudeLineage } from "../parse/claude-lineage.js";
 import type { CliSpec, PromptContext } from "../spec.js";
 

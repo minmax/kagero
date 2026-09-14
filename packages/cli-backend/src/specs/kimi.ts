@@ -26,7 +26,7 @@
  */
 
 import type { ModelInfo } from "@kagero/core";
-import { createKimiHistoryReader } from "../history-readers/kimi.js";
+import { createKimiHistoryReader } from "../history-readers/index.js";
 import { parseKimiRoles } from "../parse/kimi-roles.js";
 import type { CliSpec, PromptContext } from "../spec.js";
 

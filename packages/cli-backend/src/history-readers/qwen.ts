@@ -37,6 +37,7 @@ import {
   recordAt,
   sessionNotFoundError,
   textFromContentParts,
+  thinkingFromContentParts,
 } from "./shared.js";
 
 function projectsRoot(opts: HistoryReaderOptions | undefined): string {
@@ -83,7 +84,10 @@ async function read(
       if (text !== "") collector.push(makeEntry({ role: "user", text, line: row.line, at }));
     } else if (type === "assistant") {
       const text = textFromContentParts(parts);
-      if (text !== "") collector.push(makeEntry({ role: "assistant", text, line: row.line, at }));
+      const thinking = thinkingFromContentParts(parts);
+      if (text !== "" || thinking !== undefined) {
+        collector.push(makeEntry({ role: "assistant", text, line: row.line, at, thinking }));
+      }
       for (const part of parts) {
         const call = recordAt(part, "functionCall");
         if (call === undefined) continue;

@@ -28,6 +28,8 @@ import {
   type AgentEvent,
   type AgentResponse,
   type BackendRegistry,
+  DEFAULT_HISTORY_PAGE_SIZE,
+  MAX_HISTORY_PAGE_SIZE,
   type PromptOptions,
   renderHistory,
   unsupportedCapability,
@@ -45,6 +47,16 @@ import type {
 } from "@modelcontextprotocol/sdk/types.js";
 import { CancelledNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { StreamCompressorHub } from "./stream-compressor.js";
+import {
+  handleWatch,
+  readWatchConfig,
+  summarizeRun,
+  WATCH_TOOL_DESCRIPTION,
+  type WatchArgs,
+  type WatchConfig,
+  watchInputSchema,
+} from "./watch.js";
 
 /** Options for {@link createKageroMcpServer}. */
 export interface KageroMcpServerOptions {
@@ -62,6 +74,12 @@ export interface KageroMcpServerOptions {
    * registered backends and the honest-refusal contract.
    */
   readonly instructions?: string;
+  /**
+   * Watch/compressor configuration; default comes from the environment
+   * (KAGERO_COMPRESS_BACKEND / KAGERO_COMPRESS_MODEL). When unset on both
+   * paths the `${prefix}_watch` tool is not registered at all.
+   */
+  readonly watch?: WatchConfig | undefined;
 }
 
 /** Extra context the SDK hands to every tool handler. */
@@ -85,6 +103,7 @@ const PromptInput = z
     prompt: z.string().min(1),
     backend: z.string().optional(),
     session_id: z.string().optional(),
+    agent_name: agentNameSchema(),
     workspace_create: z.boolean().optional(),
     workspace_path: z.string().optional(),
     ...runOptionFields(),
@@ -97,6 +116,7 @@ const ResumeInput = z
     session_id: z.string(),
     prompt: z.string().min(1),
     backend: z.string().optional(),
+    agent_name: agentNameSchema(),
     ...runOptionFields(),
   })
   .strict();
@@ -105,13 +125,32 @@ type ResumeInput = z.infer<typeof ResumeInput>;
 const ModelsInput = z.object({ backend: z.string().optional() }).strict();
 type ModelsInput = z.infer<typeof ModelsInput>;
 
+/** Optional display name for the server's session registry: 1..64, no control chars. */
+function agentNameSchema() {
+  const hasControlChar = (value: string): boolean => {
+    for (const ch of value) {
+      const code = ch.codePointAt(0) ?? 0;
+      if (code <= 0x1f || code === 0x7f) return true;
+    }
+    return false;
+  };
+  return z
+    .string()
+    .max(64)
+    .refine((value) => value.trim() !== "" && !hasControlChar(value), {
+      message: "agent_name must be 1-64 characters with no control characters",
+    })
+    .optional();
+}
+
 const SessionsInput = z.object({ backend: z.string().optional() }).strict();
 type SessionsInput = z.infer<typeof SessionsInput>;
 
 const HistoryInput = z
   .object({
     session_id: z.string(),
-    last: z.number().int().positive().optional(),
+    page: z.number().int().min(0).optional(),
+    page_size: z.number().int().min(1).max(MAX_HISTORY_PAGE_SIZE).optional(),
     max_chars: z.number().int().positive().optional(),
     backend: z.string().optional(),
   })
@@ -174,7 +213,8 @@ interface RunOptionsDraft {
 
 /** Mutable draft of {@link HistoryOptions}. */
 interface HistoryOptionsDraft {
-  last?: number;
+  page?: number;
+  pageSize?: number;
   maxChars?: number;
 }
 
@@ -217,11 +257,40 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
   stop(): Promise<void>;
 } {
   const prefix = opts.toolPrefix ?? "kagero";
+  const watchConfig = opts.watch ?? readWatchConfig();
+  /** Squeezes the live event stream of the server's own runs (see module). */
+  const streamHub =
+    watchConfig === undefined
+      ? undefined
+      : new StreamCompressorHub({
+          selectAgent,
+          config: watchConfig,
+          onLiveLine: (backend, sessionId, line) => {
+            void server
+              .sendLoggingMessage({
+                level: "info",
+                logger: opts.name,
+                data: { kind: "run-stream", backend, session_id: sessionId, line },
+              })
+              .catch(() => undefined);
+          },
+        });
   const subscriptions = new Map<string, LiveSubscription>();
+  /** agent_name per `<backend>:<sessionId>`; server-lifetime only (no state file). */
+  const sessionNames = new Map<string, string>();
   const inflight = new Map<RequestId, InflightCall>();
 
   const instructions =
-    opts.instructions ?? defaultInstructions(prefix, [...opts.registry.names()].sort(), opts.defaultBackend);
+    opts.instructions ??
+    (() => {
+      const base = defaultInstructions(prefix, [...opts.registry.names()].sort(), opts.defaultBackend);
+      if (watchConfig === undefined) return base;
+      return (
+        base +
+        `\nBackground sessions: ${prefix}_watch returns a compressed delta of a running session (agenttrace-style ` +
+        `blocks with @L anchors); poll it with the returned cursor. Compressor backend: "${watchConfig.backend}".`
+      );
+    })();
 
   const server = new McpServer(
     { name: opts.name, version: opts.version },
@@ -280,7 +349,16 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
   }
 
   function toErrorResult(error: unknown): CallToolResult {
-    if (error instanceof AgentError) return errorResult(`[${error.code}] ${error.message}`);
+    if (error instanceof AgentError) {
+      // A failed run is often still resumable — never drop the session id.
+      const resumeId =
+        error.context !== undefined && typeof error.context["sessionId"] === "string"
+          ? (error.context["sessionId"] as string)
+          : undefined;
+      const resumeHint =
+        resumeId === undefined ? "" : `\n[resumable session: ${resumeId}] — pass it as session_id to ${prefix}_resume.`;
+      return errorResult(`[${error.code}] ${error.message}${resumeHint}`);
+    }
     const message = error instanceof Error ? error.message : String(error);
     return errorResult(`[internal_error] ${message}`);
   }
@@ -350,19 +428,40 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
     return draft;
   }
 
+  /**
+   * The run reply, with the session report appended when the compressor is
+   * configured. summarizeRun never throws and returns undefined on any
+   * failure — the run's own answer stays intact either way.
+   */
+  async function responseResultWithReport(backend: string, response: AgentResponse): Promise<CallToolResult> {
+    if (watchConfig === undefined || response.sessionId === undefined) return responseResult(response);
+    const report = await summarizeRun(
+      { selectAgent, defaultBackend: opts.defaultBackend, config: watchConfig },
+      backend,
+      response,
+    );
+    if (report === undefined) return responseResult(response);
+    const base = responseResult(response);
+    return { ...base, content: [{ type: "text", text: `${response.text}\n\n${report}` }] };
+  }
+
   async function handlePrompt(args: PromptInput, extra: ToolExtra): Promise<CallToolResult> {
     const entry = beginCall(extra.requestId);
     try {
       const agent = await selectAgent(args.backend);
       entry.agent = agent;
       entry.sessionId = args.session_id;
+      streamHub?.attach(agent);
       checkLimitCapabilities(agent.capabilities, args);
       if (entry.cancelDelivered && args.session_id !== undefined) {
         // The cancel raced ahead of backend selection — still land it.
         void agent.abort(args.session_id).catch(() => undefined);
       }
       const response = await agent.prompt(args.prompt, buildRunOptions(args, true));
-      return responseResult(response);
+      if (args.agent_name !== undefined && response.sessionId !== undefined) {
+        sessionNames.set(`${agent.name}:${response.sessionId}`, args.agent_name);
+      }
+      return await responseResultWithReport(agent.name, response);
     } catch (error) {
       return toErrorResult(error);
     } finally {
@@ -376,6 +475,7 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
       const agent = await selectAgent(args.backend);
       entry.agent = agent;
       entry.sessionId = args.session_id;
+      streamHub?.attach(agent);
       if (!agent.capabilities.resume) {
         throw unsupportedCapability(
           "resume",
@@ -387,7 +487,10 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
         void agent.abort(args.session_id).catch(() => undefined);
       }
       const response = await agent.resume(args.session_id, args.prompt, buildRunOptions(args, false));
-      return responseResult(response);
+      if (args.agent_name !== undefined) {
+        sessionNames.set(`${agent.name}:${response.sessionId ?? args.session_id}`, args.agent_name);
+      }
+      return await responseResultWithReport(agent.name, response);
     } catch (error) {
       return toErrorResult(error);
     } finally {
@@ -410,9 +513,11 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
       throw unsupportedCapability("sessions", "Pick a backend that tracks persistent sessions.");
     }
     const sessions = await agent.listSessions();
-    return okResult(
-      sessions.length === 0 ? "Backend reports no sessions." : JSON.stringify(sessions, null, 2),
-    );
+    const named = sessions.map((session) => {
+      const name = sessionNames.get(`${agent.name}:${session.id}`);
+      return name === undefined ? session : { ...session, name };
+    });
+    return okResult(named.length === 0 ? "Backend reports no sessions." : JSON.stringify(named, null, 2));
   }
 
   async function handleHistory(args: HistoryInput): Promise<CallToolResult> {
@@ -424,7 +529,8 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
       );
     }
     const options: HistoryOptionsDraft = {};
-    if (args.last !== undefined) options.last = args.last;
+    if (args.page !== undefined) options.page = args.page;
+    if (args.page_size !== undefined) options.pageSize = args.page_size;
     if (args.max_chars !== undefined) options.maxChars = args.max_chars;
     const result = await agent.history(args.session_id, options);
     return okResult(renderHistory(result));
@@ -554,12 +660,40 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
     {
       title: "Kagero history",
       description:
-        "Compact, normalized history of a session (one line per entry, full-log pointer at the end).",
+        "Compact, normalized history of a session (one line per entry, full-log pointer at the end). " +
+        "Pages are counted from the newest end: page 0 (default) returns the most recent page_size " +
+        `(default ${DEFAULT_HISTORY_PAGE_SIZE}, max ${MAX_HISTORY_PAGE_SIZE}) entries; the footer names ` +
+        "the next older page when one exists.",
       inputSchema: HistoryInput,
       annotations: READ_ONLY,
     },
     (args) => handleHistory(args).catch(toErrorResult),
   );
+
+  if (watchConfig !== undefined) {
+    server.registerTool(
+      `${prefix}_watch`,
+      {
+        title: "Kagero watch",
+        description: WATCH_TOOL_DESCRIPTION(watchConfig),
+        inputSchema: watchInputSchema(watchConfig),
+        annotations: READ_ONLY,
+      },
+      (args) =>
+        handleWatch(
+          {
+            selectAgent,
+            defaultBackend: opts.defaultBackend,
+            config: watchConfig,
+            hub: streamHub,
+          },
+          args as WatchArgs,
+        ).then(
+          (result) => (result.isError ? errorResult(result.text) : okResult(result.text)),
+          toErrorResult,
+        ),
+    );
+  }
 
   server.registerTool(
     `${prefix}_send`,
@@ -629,6 +763,9 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
         }
       }
       subscriptions.clear();
+      // Let in-flight background batch compressions checkpoint (bounded):
+      // an MCP timeout/retry must not kill a half-done compression.
+      await streamHub?.settleAll(180_000).catch(() => undefined);
       await opts.registry.disposeAll();
       await server.close();
     },

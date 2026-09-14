@@ -35,6 +35,8 @@ export interface SessionInfo {
   readonly cwd: string;
   readonly summary: string;
   readonly messageCount: number;
+  /** Optional display name (agent_name) when the caller or backend named the session. */
+  readonly name?: string;
 }
 
 /** Token/cost accounting as reported by a backend. */
@@ -134,6 +136,15 @@ export interface HistoryEntry {
   readonly text: string;
   readonly toolName?: string;
   readonly toolOk?: boolean;
+  /** 1-based line of the source log this entry starts at, when the reader knows it. */
+  readonly line?: number;
+  /** The assistant's thinking that produced this entry, when the format carries it. */
+  readonly thinking?: string;
+  /**
+   * Merged tool-result text for a `role: "tool"` entry (call + result are one
+   * entry in the unified view). Readers may truncate with an explicit marker.
+   */
+  readonly toolResult?: string;
 }
 
 export interface HistoryResult {
@@ -142,12 +153,37 @@ export interface HistoryResult {
   readonly totalEntries: number;
   readonly truncated: boolean;
   /** Where the full untruncated log lives. Surfaced once per rendered output. */
-  readonly fullLog?: { readonly file: string; readonly line?: number };
+  readonly fullLog?: {
+    readonly file: string;
+    readonly line?: number;
+    /** Log file size in bytes, when the source knows it. */
+    readonly totalBytes?: number;
+  };
+  /**
+   * Pagination window this result was cut to. `index` is 0-based from the
+   * newest end; `totalPages` is only set by sources that counted every entry;
+   * `bytes` marks the byte range the page covers (byte-addressed readers).
+   */
+  readonly page?: {
+    readonly index: number;
+    readonly size: number;
+    readonly totalPages?: number;
+    readonly bytes?: { readonly start: number; readonly end: number; readonly total: number };
+  };
+  /** How to fetch older entries: the next page number or an opaque cursor. */
+  readonly older?: { readonly page?: number; readonly cursor?: string };
 }
 
 export interface HistoryOptions {
-  /** How many trailing entries to return. */
+  /** How many trailing entries to return (page 0 with this page size). */
   readonly last?: number;
+  /**
+   * 0-based page counted from the NEWEST end: 0 (default) is the most recent
+   * page, 1 the one before it. Ignored when `last` is set.
+   */
+  readonly page?: number;
+  /** Entries per page. Default DEFAULT_HISTORY_PAGE_SIZE, cap MAX_HISTORY_PAGE_SIZE. */
+  readonly pageSize?: number;
   /** Per-entry character budget before the "+N chars" cut. */
   readonly maxChars?: number;
 }

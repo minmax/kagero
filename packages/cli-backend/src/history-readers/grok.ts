@@ -26,6 +26,7 @@ import * as path from "node:path";
 import type { HistoryOptions, HistoryResult } from "@kagero/core";
 import {
   argsToText,
+  asArray,
   asString,
   fileExists,
   HistoryCollector,
@@ -70,6 +71,7 @@ async function read(
   if (file === undefined) throw sessionNotFoundError("grok", sessionId);
 
   const collector = new HistoryCollector();
+  let pendingThinking: string | undefined;
   for (const row of await readJsonlRows(file)) {
     if (!isRecord(row.value)) continue;
     const type = asString(row.value.type);
@@ -77,9 +79,13 @@ async function read(
     if (type === "system" || type === "user") {
       const text = contentText(row.value.content);
       if (text !== "") collector.push(makeEntry({ role: type, text, line: row.line }));
+      if (type === "user") pendingThinking = undefined;
     } else if (type === "assistant") {
       const text = contentText(row.value.content);
-      if (text !== "") collector.push(makeEntry({ role: "assistant", text, line: row.line }));
+      if (text !== "" || pendingThinking !== undefined) {
+        collector.push(makeEntry({ role: "assistant", text, line: row.line, thinking: pendingThinking }));
+      }
+      pendingThinking = undefined;
       const calls = Array.isArray(row.value.tool_calls) ? row.value.tool_calls : [];
       for (const call of calls) {
         if (!isRecord(call)) continue;
@@ -103,8 +109,22 @@ async function read(
         text: contentText(row.value.content),
         line: row.line,
       });
+    } else if (type === "reasoning") {
+      // Buffered here, attached to the following assistant entry. Real 1.0.25
+      // rows carry the distilled thought in `summary[]
+      // ({type:"summary_text",text})`; raw CoT lives in encrypted_content and
+      // is never shipped. The `content` fallback is forward-compat only.
+      const summary = asArray(row.value.summary);
+      const thought =
+        summary
+          .map((part) => (isRecord(part) && part["type"] === "summary_text" ? asString(part["text"]) : undefined))
+          .filter((t): t is string => t !== undefined && t !== "")
+          .join("\n") || contentText(row.value.content);
+      if (thought !== "") {
+        pendingThinking = pendingThinking === undefined ? thought : `${pendingThinking}\n${thought}`;
+      }
     }
-    // "reasoning" rows (and any unknown type) are skipped.
+    // Any other row type is skipped.
   }
   return collector.buildResult(sessionId, file, opts);
 }

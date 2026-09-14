@@ -12,7 +12,9 @@
 //                             echoes the prompt so tests can assert delivery
 //   FAKE_CLI_MODE=codex       codex JSONL: thread.started, item.completed
 //                             agent_message, turn.completed with usage
-//   FAKE_CLI_MODE=dsh         plain text answer + newline (stdout only)
+//   FAKE_CLI_MODE=dsh         dsh-headless-bridge RunReport: one JSON line
+//                             ({status,text,sessionId,model,durationMs}) on
+//                             stdout; status "error" with FAKE_CLI_RESULT_ERROR
 //   FAKE_CLI_MODE=sleep       hold for FAKE_CLI_SLEEP_MS ms, then print "late"
 //   FAKE_CLI_REPORT_MODEL=0   emit no model anywhere (requested-echo test)
 //   FAKE_CLI_NO_RESULT=1      omit the result envelope (partial test)
@@ -126,9 +128,32 @@ if (mode === "claude") {
 } else if (mode === "codex") {
   codexStream();
 } else if (mode === "dsh") {
-  const profile = flagValue("--profile") ?? "headless";
-  const task = args[args.indexOf(profile) + 1] ?? "no task";
-  out(`${task}\n`);
+  // dsh-headless-bridge contract: bridge flags first, the variadic task last,
+  // exactly one RunReport JSON line on stdout.
+  const flagWithValue = new Set(["--profile", "--model", "--session", "--patch"]);
+  const positional = [];
+  for (let i = 0; i < args.length; i++) {
+    if (flagWithValue.has(args[i])) {
+      i += 1;
+      continue;
+    }
+    if (args[i] === "--json") continue;
+    positional.push(args[i]);
+  }
+  const task = positional.join(" ") || "no task";
+  const report =
+    process.env.FAKE_CLI_RESULT_ERROR === "1"
+      ? { status: "error", text: "", error: { code: "fake", message: "fake dsh error" } }
+      : {
+          status: "completed",
+          text: task,
+          sessionId: "fake-dsh-session",
+          ...(process.env.FAKE_CLI_REPORT_MODEL === "0"
+            ? {}
+            : { model: { provider: "minimax", model: "MiniMax-M3" } }),
+          durationMs: 1,
+        };
+  out(`${JSON.stringify(report)}\n`);
 } else if (mode === "sleep") {
   const ms = Number(process.env.FAKE_CLI_SLEEP_MS ?? "2000");
   // NOTE: no .unref() — the whole point is to keep the process alive.

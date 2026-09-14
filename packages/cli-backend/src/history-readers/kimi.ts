@@ -8,10 +8,12 @@
  * ending `_<id>` (legacy `session_<uuid>` vs new `ses_<uuid>`), newest wins.
  *
  * wire.jsonl is a wire-protocol event stream, not a message log:
- *  - `context.append_message` → user/assistant entry from content text parts;
+ *  - `context.append_message` → user/assistant entry from content text parts
+ *    (assistant `think` parts are captured as `thinking`);
  *  - `context.append_loop_event` with `event.type`:
  *      - `content.part` with `part.type: "text"` → appended to the open
- *        assistant entry (consecutive text parts merge; `think` is dropped);
+ *        assistant entry (consecutive text parts merge); `think` parts are
+ *        captured as the open assistant entry's `thinking`;
  *      - `tool.call` `{toolCallId, name, args}` → tool entry (seals any open
  *        assistant entry);
  *      - `tool.result` `{toolCallId, result:{output, isError?}}` → merged by
@@ -42,10 +44,12 @@ import {
   readJsonlRows,
   sessionNotFoundError,
   textFromContentParts,
+  thinkingFromContentParts,
 } from "./shared.js";
 
 interface OpenAssistant {
   readonly parts: string[];
+  thinking?: string | undefined;
   readonly line: number;
   readonly at?: string | undefined;
 }
@@ -95,7 +99,13 @@ async function read(
   const sealAssistant = (): void => {
     if (open === undefined) return;
     collector.push(
-      makeEntry({ role: "assistant", text: open.parts.join("\n"), line: open.line, at: open.at }),
+      makeEntry({
+        role: "assistant",
+        text: open.parts.join("\n"),
+        line: open.line,
+        at: open.at,
+        thinking: open.thinking,
+      }),
     );
     open = undefined;
   };
@@ -110,11 +120,13 @@ async function read(
       const message = isRecord(row.value.message) ? row.value.message : undefined;
       if (message === undefined) continue;
       const role = asString(message.role);
-      const text = textFromContentParts(Array.isArray(message.content) ? message.content : []);
+      const content = Array.isArray(message.content) ? message.content : [];
+      const text = textFromContentParts(content);
       if (text === "") continue;
       if (role === "user" || role === "assistant") {
+        const thinking = role === "assistant" ? thinkingFromContentParts(content) : undefined;
         sealAssistant();
-        collector.push(makeEntry({ role, text, line: row.line, at }));
+        collector.push(makeEntry({ role, text, line: row.line, at, thinking }));
       }
     } else if (type === "context.append_loop_event") {
       const event = isRecord(row.value.event) ? row.value.event : undefined;
@@ -123,10 +135,20 @@ async function read(
 
       if (eventType === "content.part") {
         const part = isRecord(event.part) ? event.part : undefined;
-        const text = part !== undefined && part.type === "text" ? asString(part.text) : undefined;
-        if (text === undefined) continue; // "think" and other part types are dropped
-        if (open !== undefined) open.parts.push(text);
-        else open = { parts: [text], line: row.line, at };
+        if (part === undefined) continue;
+        const text = part.type === "text" ? asString(part.text) : undefined;
+        if (text !== undefined) {
+          if (open !== undefined) open.parts.push(text);
+          else open = { parts: [text], line: row.line, at };
+          continue;
+        }
+        const thought = thinkingFromContentParts([part]);
+        if (thought === undefined) continue; // other part types are dropped
+        if (open !== undefined) {
+          open.thinking = open.thinking === undefined ? thought : `${open.thinking}\n${thought}`;
+        } else {
+          open = { parts: [], thinking: thought, line: row.line, at };
+        }
       } else if (eventType === "tool.call") {
         sealAssistant();
         collector.pushTool(

@@ -37,6 +37,7 @@ import {
   readJsonlRows,
   sessionNotFoundError,
   textFromContentParts,
+  thinkingFromContentParts,
   walkDirs,
 } from "./shared.js";
 
@@ -89,7 +90,10 @@ async function read(
       if (text !== "") collector.push(makeEntry({ role: "user", text, line: row.line, at }));
     } else if (role === "assistant") {
       const text = textFromContentParts(content);
-      if (text !== "") collector.push(makeEntry({ role: "assistant", text, line: row.line, at }));
+      const thinking = thinkingFromContentParts(content);
+      if (text !== "" || thinking !== undefined) {
+        collector.push(makeEntry({ role: "assistant", text, line: row.line, at, thinking }));
+      }
       for (const part of content) {
         if (!isRecord(part) || part.type !== "toolCall") continue;
         collector.pushTool(

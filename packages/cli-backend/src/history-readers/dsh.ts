@@ -38,8 +38,9 @@
  */
 
 import { readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import * as path from "node:path";
-import { zstdDecompressSync } from "node:zlib";
+import type * as zlibTypes from "node:zlib";
 import type { HistoryOptions, HistoryResult } from "@kagero/core";
 import { AgentError } from "@kagero/core";
 import {
@@ -62,6 +63,7 @@ import {
   recordAt,
   sessionNotFoundError,
   textFromContentParts,
+  thinkingFromContentParts,
 } from "./shared.js";
 
 /** zstd frame magic (little-endian 0xFD2FB528) — every frame starts with it. */
@@ -97,8 +99,18 @@ export function splitZstdFrames(buf: Buffer): Buffer[] {
   return frames;
 }
 
+/**
+ * node:zlib is required lazily: a top-level named import of
+ * `zstdDecompressSync` kills the whole module graph on node < 22.16 (the
+ * export does not exist there), which used to crash every MCP server that
+ * statically pulled this reader. Required at call time, the missing export
+ * degrades to the honest AgentError below — only dsh history calls fail.
+ */
+const requireZlib = createRequire(import.meta.url);
+
 /** Multi-frame zstd → the original JSONL text; single-frame files degrade fine. */
 export function decompressSessionLog(file: string, buf: Buffer): string {
+  const { zstdDecompressSync } = requireZlib("node:zlib") as typeof zlibTypes;
   if (typeof zstdDecompressSync !== "function") {
     throw new AgentError(
       "cli_error",
@@ -187,11 +199,13 @@ async function read(
       if (text === "") continue;
       collector.push(makeEntry({ role: "user", text, line: row.line, at }));
     } else if (type === "assistant/message") {
-      // text parts only: reasoning is dropped, tool-call parts have dedicated
+      // Text and thinking parts only: tool-call parts have dedicated
       // `tool/call` rows and would otherwise double as entries.
-      const text = textFromContentParts(asArray(recordAt(data, "message")?.content));
-      if (text === "") continue;
-      collector.push(makeEntry({ role: "assistant", text, line: row.line, at }));
+      const content = asArray(recordAt(data, "message")?.content);
+      const text = textFromContentParts(content);
+      const thinking = thinkingFromContentParts(content);
+      if (text === "" && thinking === undefined) continue;
+      collector.push(makeEntry({ role: "assistant", text, line: row.line, at, thinking }));
     } else if (type === "tool/call") {
       collector.pushTool(
         asString(data?.callId),

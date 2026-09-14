@@ -37,7 +37,6 @@ import {
   newestPath,
   readJsonlRows,
   sessionNotFoundError,
-  textFromContentParts,
 } from "./shared.js";
 
 function projectsRoot(opts: HistoryReaderOptions | undefined): string {
@@ -57,7 +56,16 @@ async function findSessionFile(root: string, sessionId: string): Promise<string 
 /** Tool-result payload: string content or a list of text parts. */
 function resultText(content: unknown): string {
   if (typeof content === "string") return content;
-  if (Array.isArray(content)) return textFromContentParts(content);
+  if (Array.isArray(content)) {
+    const parts: string[] = [];
+    for (const block of content) {
+      if (!isRecord(block)) continue;
+      if (block["type"] === "image") parts.push("[image]");
+      const text = asString(block["text"]);
+      if (text !== undefined) parts.push(text);
+    }
+    return parts.join("\n");
+  }
   return "";
 }
 
@@ -81,12 +89,16 @@ async function read(
     const blocks = Array.isArray(content) ? content : [];
 
     if (type === "user") {
+      // Harness meta rows (is_meta) are plumbing, not operator speech — skip.
+      if (row.value["isMeta"] === true) continue;
       const texts: string[] = [];
       for (const block of blocks) {
         if (!isRecord(block)) continue;
         if (block.type === "text") {
           const text = asString(block.text);
           if (text !== undefined) texts.push(text);
+        } else if (block.type === "image") {
+          texts.push("[image]");
         } else if (block.type === "tool_result") {
           const isError = block.is_error;
           collector.mergeOrPushToolResult({
@@ -102,19 +114,25 @@ async function read(
       if (text !== "") collector.push(makeEntry({ role: "user", text, line: row.line, at }));
     } else {
       const texts: string[] = [];
+      const thinkingChunks: string[] = [];
       const toolEntries: { id: string | undefined; block: Record<string, unknown> }[] = [];
       for (const block of blocks) {
         if (!isRecord(block)) continue;
         if (block.type === "text") {
           const text = asString(block.text);
           if (text !== undefined) texts.push(text);
+        } else if (block.type === "thinking") {
+          const t = asString(block.thinking) ?? asString(block.text);
+          if (t !== undefined && t !== "") thinkingChunks.push(t);
         } else if (block.type === "tool_use") {
           toolEntries.push({ id: asString(block.id), block });
         }
-        // "thinking" blocks are dropped.
       }
       const text = texts.join("\n");
-      if (text !== "") collector.push(makeEntry({ role: "assistant", text, line: row.line, at }));
+      const thinking = thinkingChunks.length > 0 ? thinkingChunks.join("\n") : undefined;
+      if (text !== "" || thinking !== undefined) {
+        collector.push(makeEntry({ role: "assistant", text, line: row.line, at, thinking }));
+      }
       for (const { id, block } of toolEntries) {
         collector.pushTool(
           id,

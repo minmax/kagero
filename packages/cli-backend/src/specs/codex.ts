@@ -19,7 +19,7 @@
  *    the only deadline.
  */
 
-import { createCodexHistoryReader } from "../history-readers/codex.js";
+import { createCodexHistoryReader } from "../history-readers/index.js";
 import { parseCodexJsonl } from "../parse/codex-jsonl.js";
 import type { CliSpec, PromptContext } from "../spec.js";
 
@@ -39,15 +39,7 @@ const codexSpec: CliSpec = {
         // and the JSONL parser would find nothing. --skip-git-repo-check is
         // accepted by `exec resume` too; without it a resume outside a trusted
         // git repo fails with "Not inside a trusted directory".
-        return [
-          "exec",
-          "resume",
-          ctx.sessionId,
-          "--json",
-          "--skip-git-repo-check",
-          ...modelArgs,
-          ctx.prompt,
-        ];
+        return ["exec", "resume", ctx.sessionId, "--json", "--skip-git-repo-check", ...modelArgs, ctx.prompt];
       }
       return [
         "exec",

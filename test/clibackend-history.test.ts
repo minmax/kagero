@@ -168,8 +168,8 @@ describe("pi history reader", () => {
     expect(entries.map((e) => e.index)).toEqual([1, 2, 3, 4, 5, 6, 7]);
     expect(entries[0]).toMatchObject({ role: "user", text: "find the bug", at: "2026-09-12T10:00:01.000Z" });
     expect(entries[1]).toMatchObject({ role: "assistant", text: "Looking", at: "2026-09-12T10:00:02.000Z" });
-    // Thinking blocks never surface; toolCall becomes a tool entry merged
-    // with its toolResult (isError: false → toolOk: true).
+    // Thinking surfaces as the assistant entry's `thinking`; toolCall becomes
+    // a tool entry merged with its toolResult (isError: false → toolOk: true).
     expect(entries[2]).toEqual({
       index: 3,
       role: "tool",
@@ -177,6 +177,8 @@ describe("pi history reader", () => {
       text: '{"path":"/x.ts"}',
       toolName: "read",
       toolOk: true,
+      toolResult: "file body",
+      line: 4, // the assistant row carrying the toolCall
     });
     expect(entries[6]).toMatchObject({ role: "tool", toolName: "edit", toolOk: false });
   });
@@ -364,7 +366,7 @@ describe("kimi history reader", () => {
     ]);
   }
 
-  it("merges content.part streams, tool calls/results; drops think and service events", async () => {
+  it("merges content.part streams, tool calls/results; captures think as thinking, skips service events", async () => {
     const home = await makeHome();
     const file = await fixture(home);
     const result = await createKimiHistoryReader({ homeDir: home }).read(sessionId, undefined);
@@ -375,12 +377,15 @@ describe("kimi history reader", () => {
     const entries = result.entries;
     expect(entries[0]).toMatchObject({ index: 1, role: "user", text: "study the spec" });
     expect(entries[0]?.at).toBeUndefined(); // append_message carries no time
-    // Consecutive text parts merge into one assistant entry (think dropped).
+    // Consecutive text parts merge into one assistant entry (think captured
+    // as thinking). Entry opens on the first content.part row.
     expect(entries[1]).toEqual({
       index: 2,
       role: "assistant",
       at: iso(1781808830000),
       text: "Reading\nthe spec",
+      thinking: "hmm",
+      line: 3,
     });
     expect(entries[2]).toEqual({
       index: 3,
@@ -389,6 +394,8 @@ describe("kimi history reader", () => {
       text: '{"path":"/s.md"}',
       toolName: "read",
       toolOk: true,
+      toolResult: "spec body",
+      line: 6, // the tool.call row
     });
     expect(entries[3]).toMatchObject({ index: 4, role: "assistant", text: "Summarised" });
     expect(entries[4]).toMatchObject({ index: 5, role: "tool", toolName: "bash", toolOk: false });
@@ -471,16 +478,28 @@ describe("grok history reader", () => {
     expect(entries.map((e) => e.role)).toEqual(["system", "user", "tool", "assistant", "tool", "user"]);
     for (const entry of entries) expect(entry.at).toBeUndefined(); // format has no timestamps
     expect(entries[0]).toMatchObject({ index: 1, text: "You are Grok" });
-    // Flat tool_calls shape; reasoning rows are skipped.
+    // Flat tool_calls shape; reasoning rows buffer as thinking (empty here,
+    // so nothing attaches). Tool entries start on their assistant row and
+    // carry the merged result text.
     expect(entries[2]).toEqual({
       index: 3,
       role: "tool",
       text: '{"target_file":"x"}',
       toolName: "read_file",
       toolOk: true,
+      toolResult: "skills body",
+      line: 3,
     });
     // Nested function.name shape; status "error" → toolOk false.
-    expect(entries[4]).toEqual({ index: 5, role: "tool", text: "{}", toolName: "run", toolOk: false });
+    expect(entries[4]).toEqual({
+      index: 5,
+      role: "tool",
+      text: "{}",
+      toolName: "run",
+      toolOk: false,
+      toolResult: "nope",
+      line: 6,
+    });
     expect(entries[5]).toMatchObject({ index: 6, text: "thanks (parts form)" });
   });
 
@@ -585,6 +604,8 @@ describe("mcode history reader", () => {
       text: '{"name":"video"}',
       toolName: "skill",
       toolOk: true,
+      toolResult: "skill ran",
+      line: 2, // the assistant row carrying the toolCall
     });
     expect(entries[3]).toMatchObject({ index: 4, role: "assistant", text: "Video plan ready" });
   });
@@ -704,6 +725,8 @@ describe("claude history reader", () => {
       text: '{"file_path":"/p"}',
       toolName: "read",
       toolOk: true,
+      toolResult: "file text",
+      line: 2, // the assistant row carrying the tool_use
     });
     // is_error: true → toolOk false; the user text in the same row still lands.
     expect(entries[3]).toMatchObject({ index: 4, role: "tool", toolName: "bash", toolOk: false });
@@ -862,6 +885,8 @@ describe("codex history reader", () => {
       at: "2026-09-12T10:00:03.000Z",
       text: '{"cmd":"ls"}',
       toolName: "exec_command",
+      toolResult: "Process exited with code 0",
+      line: 4, // the function_call row
     });
     // The format carries no structured error flag — toolOk stays unset.
     expect(entries[2]?.toolOk).toBeUndefined();

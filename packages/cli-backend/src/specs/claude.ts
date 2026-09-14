@@ -17,7 +17,7 @@
  *  - ACP: Claude Code has no stable public ACP mode in this CLI — print only.
  */
 
-import { createClaudeHistoryReader } from "../history-readers/claude.js";
+import { createClaudeHistoryReader } from "../history-readers/index.js";
 import { parseClaudeLineage } from "../parse/claude-lineage.js";
 import type { CliSpec, PromptContext } from "../spec.js";
 
@@ -30,7 +30,9 @@ const claudeSpec: CliSpec = {
   print: {
     resumeCapable: true,
     args(ctx: PromptContext): string[] {
-      const args: string[] = ["-p", ctx.prompt, "--output-format", "stream-json"];
+      // `--` first: a caller prompt starting with "-" would otherwise be
+      // argv-parsed as an option (live-verified: claude -p "-x test" errors).
+      const args: string[] = ["-p", "--", ctx.prompt, "--output-format", "stream-json"];
       if (ctx.opts.modelId !== undefined) {
         args.push("--model", ctx.opts.modelId);
       }

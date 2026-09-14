@@ -176,6 +176,7 @@ describe("claude spec", () => {
     );
     expect(args).toEqual([
       "-p",
+      "--",
       "hi there",
       "--output-format",
       "stream-json",
@@ -189,7 +190,7 @@ describe("claude spec", () => {
 
   it("adds nothing for approval default and no limits", () => {
     const args = claudeSpec.print?.args(ctx({ prompt: "hi" }));
-    expect(args).toEqual(["-p", "hi", "--output-format", "stream-json"]);
+    expect(args).toEqual(["-p", "--", "hi", "--output-format", "stream-json"]);
   });
 
   it("resumes with --resume <id>", () => {

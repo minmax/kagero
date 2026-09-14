@@ -155,13 +155,14 @@ async function cmdMcp(args: string[]): Promise<number> {
     console.error(`[unknown_backend] ${requested}. Available: ${valid.join(", ")}`);
     return 2;
   }
-  const { createKageroMcpServer } = await import("@kagero/mcp");
+  const { createKageroMcpServer, readWatchConfig } = await import("@kagero/mcp");
   const server = createKageroMcpServer({
     name: "kagero-mcp",
     version: VERSION,
     toolPrefix: "kagero",
     registry,
     defaultBackend: requested,
+    watch: readWatchConfig(),
   });
   let stopped = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -217,6 +218,10 @@ Commands:
 
 Environment:
   KAGERO_BACKEND          default backend (${availableBackends().join(" | ")})
+  KAGERO_COMPRESS_BACKEND backend for the watch compressor (enables kagero_watch)
+  KAGERO_COMPRESS_MODEL   model override for the compressor runs
+  KAGERO_WATCH_MAX_WAIT_MS   cap for kagero_watch wait_ms (default 600000)
+  KAGERO_WATCH_RAW_THRESHOLD_CHARS  deltas under this size skip the compressor (default 1500)
 `);
 }
 

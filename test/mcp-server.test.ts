@@ -132,14 +132,16 @@ class FakeAgent implements Agent {
   async history(sessionId: string, opts?: HistoryOptions): Promise<HistoryResult> {
     this.historyCalls.push(opts === undefined ? { sessionId } : { sessionId, opts });
     const entries: HistoryEntry[] = [
-      { index: 0, role: "user", text: "list the files", at: "2026-09-12T10:00:00Z" },
-      { index: 1, role: "assistant", text: "two files: a.ts, b.ts", at: "2026-09-12T10:00:05Z" },
+      { index: 8, role: "user", text: "list the files", at: "2026-09-12T10:00:00Z" },
+      { index: 9, role: "assistant", text: "two files: a.ts, b.ts", at: "2026-09-12T10:00:05Z" },
     ];
     return {
       sessionId,
       entries,
       totalEntries: 9,
       truncated: true,
+      page: { index: 0, size: 2, totalPages: 5 },
+      older: { page: 1 },
       fullLog: { file: "/logs/sess-h.jsonl", line: 3 },
     };
   }
@@ -279,19 +281,28 @@ describe("kagero MCP server", () => {
 
   it("renders session history through the core renderer", async () => {
     const { client, agent } = await makeHarness();
-    const result = await call(client, "kagero_history", { session_id: "sess-h", last: 2, max_chars: 40 });
+    const result = await call(client, "kagero_history", {
+      session_id: "sess-h",
+      page_size: 2,
+      max_chars: 40,
+    });
     expect(result.isError).toBeFalsy();
     const text = textOf(result);
-    expect(text).toContain("session sess-h — 2/9 entries (truncated)");
-    expect(text).toContain("#1 asst");
+    expect(text).toContain("session sess-h — 2/9 entries (truncated) · page 1/5");
+    expect(text).toContain("#9 asst");
     expect(text).toContain("two files: a.ts, b.ts");
     expect(text).toContain("— full history: /logs/sess-h.jsonl (from line 3)");
+    expect(text).toContain("— older entries: page=1");
 
-    expect(agent.historyCalls).toHaveLength(1);
+    const olderPage = await call(client, "kagero_history", { session_id: "sess-h", page: 1 });
+    expect(olderPage.isError).toBeFalsy();
+
+    expect(agent.historyCalls).toHaveLength(2);
     const recorded = agent.historyCalls[0];
     expect(recorded?.sessionId).toBe("sess-h");
-    expect(recorded?.opts?.last).toBe(2);
+    expect(recorded?.opts?.pageSize).toBe(2);
     expect(recorded?.opts?.maxChars).toBe(40);
+    expect(agent.historyCalls[1]?.opts?.page).toBe(1);
   });
 
   it("refuses requested limits the backend cannot honor", async () => {

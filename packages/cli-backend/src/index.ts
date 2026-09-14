@@ -35,3 +35,4 @@ export {
   deriveCapabilities,
 } from "./spec.js";
 export { claudeSpec, codexSpec, dshSpec, grokSpec, kimiSpec, mcodeSpec, qwenSpec } from "./specs/index.js";
+export { ClaudeStreamAgent } from "./claude-stream.js";

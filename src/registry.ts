@@ -26,6 +26,11 @@ registry.register("claude", async () => {
   return new CliSpecAgent(claudeSpec);
 });
 
+registry.register("claude-stream", async () => {
+  const { ClaudeStreamAgent } = await import("@kagero/cli-backend");
+  return new ClaudeStreamAgent();
+});
+
 registry.register("codex", async () => {
   const { CliSpecAgent, codexSpec } = await import("@kagero/cli-backend");
   return new CliSpecAgent(codexSpec);

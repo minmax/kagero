@@ -324,7 +324,11 @@ export class CliSpecAgent implements Agent {
         if (sessionId !== "") handle.sessionIds.add(sessionId);
         this.dispatch(route, { ...event, at: new Date().toISOString() } as AgentEvent);
       },
-      permissionOption: ctx.opts.approvalMode === "yolo" ? "approve_always" : "approve_once",
+      permissionOption: (() => {
+        const options = this.spec.acp?.permissionOptions;
+        if (options === undefined) return ctx.opts.approvalMode === "yolo" ? "approve_always" : "approve_once";
+        return ctx.opts.approvalMode === "yolo" ? options.always : options.once;
+      })(),
     });
     handle.client = client;
 

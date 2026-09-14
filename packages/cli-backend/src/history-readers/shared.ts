@@ -4,9 +4,12 @@
  * Every reader turns one CLI's on-disk JSONL log into a HistoryResult:
  *  - entries carry through-numbered 1-based `index` positions over the FULL
  *    log (service rows and skipped events do not consume an index);
- *  - the result holds the LAST `last` (default 20) entries; `truncated` is
- *    true when the log holds more; `fullLog.line` then points at the file
- *    line where the FIRST not-shown entry starts, otherwise it is 1;
+ *  - the result is one PAGE of the log (resolveHistoryPage): page 0 (the
+ *    default) holds the newest DEFAULT_HISTORY_PAGE_SIZE entries; `page`
+ *    counts older-ward; `truncated` is true when the log holds entries
+ *    outside the page; `older` names the next page when one exists;
+ *    `fullLog.line` points at the file line of the oldest not-shown entry,
+ *    otherwise 1;
  *  - a tool call becomes a `role: "tool"` entry; its result merges into that
  *    entry by call id when the id is known (falling back to the immediately
  *    preceding unresolved tool entry when the format has no ids), otherwise
@@ -26,7 +29,7 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { HistoryEntry, HistoryOptions, HistoryResult } from "@kagero/core";
-import { AgentError } from "@kagero/core";
+import { AgentError, resolveHistoryPage } from "@kagero/core";
 
 export type { HistoryReader } from "../spec.js";
 
@@ -70,15 +73,35 @@ export function recordAt(value: unknown, key: string): Record<string, unknown> |
 
 /** Concatenate `{"type":"text","text":...}`-shaped parts with newlines. */
 export function textFromContentParts(parts: readonly unknown[]): string {
-  const chunks: string[] = [];
-  for (const part of parts) {
-    if (!isRecord(part)) continue;
-    const type = part.type;
-    if (type !== undefined && type !== "text") continue;
-    const text = asString(part.text);
-    if (text !== undefined) chunks.push(text);
-  }
-  return chunks.join("\n");
+	const chunks: string[] = [];
+	for (const part of parts) {
+		if (!isRecord(part)) continue;
+		const type = part.type;
+		if (type !== undefined && type !== "text") continue;
+		const text = asString(part.text);
+		if (text !== undefined) chunks.push(text);
+	}
+	return chunks.join("\n");
+}
+
+const THINKING_TYPES = new Set(["thinking", "thought", "reasoning", "think"]);
+
+/**
+ * Concatenate thinking parts (the reasoning carrier the digest compressor
+ * needs). Formats vary: `{type:"thinking",thinking}`, `{type:"think",text}`,
+ * `{type:"reasoning",reasoning|text}`, `{thought:true,text}`.
+ */
+export function thinkingFromContentParts(parts: readonly unknown[]): string | undefined {
+	const chunks: string[] = [];
+	for (const part of parts) {
+		if (!isRecord(part)) continue;
+		const type = asString(part.type);
+		const isThinking = (type !== undefined && THINKING_TYPES.has(type)) || part.thought === true;
+		if (!isThinking) continue;
+		const text = asString(part.thinking) ?? asString(part.think) ?? asString(part.reasoning) ?? asString(part.text);
+		if (text !== undefined && text !== "") chunks.push(text);
+	}
+	return chunks.length > 0 ? chunks.join("\n") : undefined;
 }
 
 /** Render tool arguments as compact text: strings pass through, objects as JSON. */
@@ -203,31 +226,40 @@ export function isSafeSessionId(sessionId: string): boolean {
 
 /** A mutable entry under assembly; frozen into HistoryEntry at the end. */
 export interface MutableEntry {
-  role: HistoryRole;
-  text: string;
-  /** 1-based file line the entry starts at. */
-  line: number;
-  at?: string;
-  toolName?: string;
-  toolOk?: boolean;
+	role: HistoryRole;
+	text: string;
+	/** 1-based file line the entry starts at. */
+	line: number;
+	at?: string;
+	toolName?: string;
+	toolOk?: boolean;
+	/** Assistant thinking that produced this entry, when the format carries it. */
+	thinking?: string;
+	/** Merged tool-result text (capped); only on role "tool" entries. */
+	toolResult?: string;
 }
 
+/** Results merged into a call entry are capped — full text lives in the log. */
+const MAX_MERGED_RESULT_CHARS = 40_000;
+
 export interface NewEntryInit {
-  readonly role: HistoryRole;
-  readonly text: string;
-  readonly line: number;
-  /** Optional fields accept explicit undefined; they are copied only when set. */
-  readonly at?: string | undefined;
-  readonly toolName?: string | undefined;
-  readonly toolOk?: boolean | undefined;
+	readonly role: HistoryRole;
+	readonly text: string;
+	readonly line: number;
+	/** Optional fields accept explicit undefined; they are copied only when set. */
+	readonly at?: string | undefined;
+	readonly toolName?: string | undefined;
+	readonly toolOk?: boolean | undefined;
+	readonly thinking?: string | undefined;
 }
 
 export function makeEntry(init: NewEntryInit): MutableEntry {
-  const entry: MutableEntry = { role: init.role, text: init.text, line: init.line };
-  if (init.at !== undefined) entry.at = init.at;
-  if (init.toolName !== undefined) entry.toolName = init.toolName;
-  if (init.toolOk !== undefined) entry.toolOk = init.toolOk;
-  return entry;
+	const entry: MutableEntry = { role: init.role, text: init.text, line: init.line };
+	if (init.at !== undefined) entry.at = init.at;
+	if (init.toolName !== undefined) entry.toolName = init.toolName;
+	if (init.toolOk !== undefined) entry.toolOk = init.toolOk;
+	if (init.thinking !== undefined) entry.thinking = init.thinking;
+	return entry;
 }
 
 export interface ToolResultInit {
@@ -266,57 +298,77 @@ export class HistoryCollector {
     if (callId !== undefined) this.#pendingById.set(callId, entry);
   }
 
-  /** Route a tool result: merge into its call entry or fall back to a new one. */
-  mergeOrPushToolResult(init: ToolResultInit): void {
-    const byId = init.callId !== undefined ? this.#pendingById.get(init.callId) : undefined;
-    const fallback =
-      init.callId === undefined && this.#lastTool !== undefined && this.#lastTool.toolOk === undefined
-        ? this.#lastTool
-        : undefined;
-    const target = byId ?? fallback;
-    if (target !== undefined) {
-      if (init.callId !== undefined) this.#pendingById.delete(init.callId);
-      if (init.toolOk !== undefined) target.toolOk = init.toolOk;
-      return;
-    }
-    this.push(
-      makeEntry({
-        role: "tool",
-        text: init.text,
-        line: init.line,
-        at: init.at,
-        toolName: init.toolName,
-        toolOk: init.toolOk,
-      }),
-    );
-  }
+	/** Route a tool result: merge into its call entry or fall back to a new one. */
+	mergeOrPushToolResult(init: ToolResultInit): void {
+		const byId = init.callId !== undefined ? this.#pendingById.get(init.callId) : undefined;
+		const fallback =
+			init.callId === undefined && this.#lastTool !== undefined && this.#lastTool.toolOk === undefined
+				? this.#lastTool
+				: undefined;
+		const target = byId ?? fallback;
+		if (target !== undefined) {
+			if (init.callId !== undefined) this.#pendingById.delete(init.callId);
+			if (init.toolOk !== undefined) target.toolOk = init.toolOk;
+			// Keep the result text on the merged entry: the history view ignores
+			// it, but the digest compressor needs the call's outcome.
+			if (init.text !== "") {
+				const cap = MAX_MERGED_RESULT_CHARS;
+				const prev = target.toolResult;
+				const combined = prev === undefined ? init.text : `${prev}\n${init.text}`;
+				target.toolResult =
+					combined.length <= cap ? combined : `${combined.slice(0, cap)}…(+${combined.length - cap} chars)`;
+			}
+			return;
+		}
+		this.push(
+			makeEntry({
+				role: "tool",
+				text: init.text,
+				line: init.line,
+				at: init.at,
+				toolName: init.toolName,
+				toolOk: init.toolOk,
+			}),
+		);
+	}
 
-  /** Assemble the final HistoryResult over the collected entries. */
+  /**
+   * Assemble the final HistoryResult over the collected entries, cut to the
+   * page the caller asked for (default: the newest page). Entry indexes stay
+   * global over the full log, so `#37` means the same thing on every page.
+   */
   buildResult(sessionId: string, file: string, opts: HistoryOptions | undefined): HistoryResult {
-    const last = Math.max(0, Math.trunc(opts?.last ?? 20));
     const total = this.#entries.length;
-    const truncated = total > last;
-    const skip = truncated ? total - last : 0;
-    const entries = this.#entries.slice(skip).map((entry, i) => toHistoryEntry(entry, skip + i + 1));
+    const window = resolveHistoryPage(total, opts);
+    const entries = this.#entries
+      .slice(window.skip, window.skip + window.take)
+      .map((entry, i) => toHistoryEntry(entry, window.skip + i + 1));
+    const truncated = total > window.take;
+    const older = window.page + 1 < window.totalPages ? { page: window.page + 1 } : undefined;
     return {
       sessionId,
       entries,
       totalEntries: total,
       truncated,
+      page: { index: window.page, size: window.size, totalPages: window.totalPages },
+      ...(older !== undefined ? { older } : {}),
       fullLog: { file, line: truncated ? (this.#entries[0]?.line ?? 1) : 1 },
     };
   }
 }
 
 function toHistoryEntry(entry: MutableEntry, index: number): HistoryEntry {
-  return {
-    index,
-    role: entry.role,
-    ...(entry.at !== undefined ? { at: entry.at } : {}),
-    text: entry.text,
-    ...(entry.toolName !== undefined ? { toolName: entry.toolName } : {}),
-    ...(entry.toolOk !== undefined ? { toolOk: entry.toolOk } : {}),
-  };
+	return {
+		index,
+		role: entry.role,
+		...(entry.at !== undefined ? { at: entry.at } : {}),
+		text: entry.text,
+		...(entry.toolName !== undefined ? { toolName: entry.toolName } : {}),
+		...(entry.toolOk !== undefined ? { toolOk: entry.toolOk } : {}),
+		...(entry.thinking !== undefined ? { thinking: entry.thinking } : {}),
+		...(entry.toolResult !== undefined ? { toolResult: entry.toolResult } : {}),
+		line: entry.line,
+	};
 }
 
 /** Canonical not-found error: readers reject (never resolve empty) on miss. */

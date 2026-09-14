@@ -529,9 +529,17 @@ describe.skipIf(!zstdAvailable)("dsh history reader (multi-frame zstd)", () => {
       text: "Reply with exactly: PONG",
       at: iso(T1),
     });
-    // reasoning is dropped, the text part survives; the parallel tool-call
-    // content part must NOT become a second entry (dedicated tool/call rows do).
-    expect(entries[2]).toEqual({ index: 3, role: "assistant", at: iso(T2), text: "PONG" });
+    // reasoning is captured as thinking, the text part survives; the parallel
+    // tool-call content part must NOT become a second entry (dedicated
+    // tool/call rows do).
+    expect(entries[2]).toEqual({
+      index: 3,
+      role: "assistant",
+      at: iso(T2),
+      text: "PONG",
+      thinking: "just say PONG",
+      line: 6, // the assistant/message row
+    });
     expect(entries[3]).toEqual({
       index: 4,
       role: "tool",
@@ -539,6 +547,8 @@ describe.skipIf(!zstdAvailable)("dsh history reader (multi-frame zstd)", () => {
       text: '{"code":"1+1"}',
       toolName: "run_code",
       toolOk: true, // isError: false merged by callId
+      toolResult: "2",
+      line: 7, // the tool/call row
     });
     expect(entries[4]).toMatchObject({ index: 5, role: "tool", toolName: "bash", toolOk: false });
     expect(entries[5]).toMatchObject({ index: 6, role: "assistant", text: "Done", at: iso(T3) });

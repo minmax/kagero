@@ -1,14 +1,24 @@
 /**
- * pi-rpc backend — talks to `pi --mode rpc` over stdio.
+ * pi-rpc backend — drives `pi --mode rpc` over stdio.
  *
- * Same Agent interface as the in-process SDK, but goes through a subprocess.
- * Useful when the user prefers the official CLI (or doesn't want to install
- * the SDK as a runtime dep).
+ * The REAL pi rpc protocol (verified live, and mirrored from pi-mcp's
+ * transport): stdin takes one JSONL command `{type:"prompt", message}`;
+ * stdout answers `{type:"response", command:"prompt", success}` and then
+ * streams typed events — agent_start/turn_start/turn_end/agent_end,
+ * message_start/message_end (full message records: role user|assistant|
+ * toolResult, content parts, model, usage), message_update (streaming
+ * deltas), tool_execution_start/tool_execution_end, auto_retry_start —
+ * until `agent_settled` marks the end of the turn. Closing stdin is how the
+ * process is asked to shut down; an in-flight turn ends with `{type:"abort"}`.
+ *
+ * One long-lived process per model: the model is chosen at spawn
+ * (`--model <id>`), so a prompt with a different modelId restarts the
+ * process. Each prompt turn is reported under its own generated session id
+ * (`rpc-<n>`); pi keeps no cross-turn session here, so `resume` is honestly
+ * unsupported.
  */
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { resolve } from "node:path";
 import type {
   Agent,
   AgentCapabilities,
@@ -21,105 +31,136 @@ import type {
   PromptOptions,
   SessionInfo,
 } from "@kagero/core";
-import { AgentError, unsupportedCapability } from "@kagero/core";
+import { AgentError, resolveBinary, unsupportedCapability } from "@kagero/core";
 
-type RpcResponse = {
-  type: "response";
-  id: number;
-  result?: unknown;
-  error?: { message: string };
-};
+type RpcEvent = { type: string; [k: string]: unknown };
 
-type RpcEvent = {
-  type: string;
-  [k: string]: unknown;
-};
-
-function isResponse(x: unknown): x is RpcResponse {
-  return (
-    typeof x === "object" &&
-    x !== null &&
-    (x as { type?: string }).type === "response" &&
-    typeof (x as { id?: unknown }).id === "number"
-  );
+/** Content part shapes we read (parse, don't cast — logs are untrusted). */
+function textFromParts(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const part of content) {
+    if (typeof part === "object" && part !== null && (part as { type?: unknown }).type === "text") {
+      const text = (part as { text?: unknown }).text;
+      if (typeof text === "string") parts.push(text);
+    }
+  }
+  return parts.join("\n");
 }
 
-function isEvent(x: unknown): x is RpcEvent {
-  return typeof x === "object" && x !== null && typeof (x as { type?: unknown }).type === "string";
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export class PiRpcAgent implements Agent {
   public readonly name = "pi-rpc";
 
   public readonly capabilities: AgentCapabilities = {
-    resume: true,
+    resume: false,
     models: true,
-    sessions: true,
+    sessions: false,
     history: false,
     subscribe: true,
     abort: true,
     steer: true,
     followUp: true,
     limits: { timeout: false, maxTurns: false, maxToolCalls: false },
-    workspaceCreate: true,
+    workspaceCreate: false,
   };
 
   private proc: ChildProcess | null = null;
-  private nextId = 1;
-  private pending = new Map<number, { resolve: (r: RpcResponse) => void; reject: (err: Error) => void }>();
-  private subscribers = new Map<string, Set<(e: AgentEvent) => void>>();
+  private procModel: string | undefined;
   private buffer = "";
-  private collectedText = "";
+  private subscribers = new Map<string, Set<(e: AgentEvent) => void>>();
+  private turnSeq = 0;
+  /** The turn currently being pumped: its session id and collected text. */
+  private active:
+    | {
+        sessionId: string;
+        text: string[];
+        model: string | undefined;
+        usage:
+          | {
+              inputTokens?: number;
+              outputTokens?: number;
+              reasoningTokens?: number;
+            }
+          | undefined;
+        errorMessage: string | undefined;
+        /** Set once the turn resolved one way or another — no second event. */
+        finished: boolean;
+        settled: (response: AgentResponse) => void;
+        failed: (error: AgentError) => void;
+      }
+    | undefined;
+  /** Pending prompt-command acknowledgements (id → settle hooks). */
+  private readonly promptAcks = new Map<
+    string,
+    { settled: () => void; failed: (error: AgentError) => void }
+  >();
+  /** Serializes turn starts: pi accepts one prompt at a time. */
+  private turnQueue: Promise<void> = Promise.resolve();
 
-  private start(): ChildProcess {
-    if (this.proc) return this.proc;
+  // --- process lifecycle -----------------------------------------------------
+
+  private start(model: string | undefined): ChildProcess {
+    if (this.proc !== null && this.procModel === model) return this.proc;
+    if (this.proc !== null) this.stopProc();
     const bin = this.resolveBinary();
-    const proc = spawn(bin, ["--mode", "rpc", "--no-session"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      detached: true,
-    });
+    const proc = spawn(
+      bin,
+      ["--mode", "rpc", "--no-session", ...(model === undefined ? [] : ["--model", model])],
+      {
+        stdio: ["pipe", "pipe", "pipe"],
+        detached: true,
+      },
+    );
     proc.unref();
     proc.stdout?.setEncoding("utf8");
     proc.stdout?.on("data", (chunk: string) => this.ingest(chunk));
     proc.stderr?.on("data", () => {
-      // swallow — RPC errors are reported via response objects
-    });
-    proc.on("error", (err) => {
-      // Reject all pending calls so callers don't hang
-      const err2 = new AgentError("spawn_failed", err.message, "internal", { binary: bin });
-      for (const [id, p] of this.pending) {
-        p.reject(err2);
-        this.pending.delete(id);
-      }
-      this.proc = null;
+      // stderr is pi's own diagnostics; protocol errors arrive as events.
     });
     proc.on("close", () => {
-      // Reject all in-flight calls on proc death
-      const err = new AgentError("rpc_closed", "pi rpc subprocess closed unexpectedly", "internal");
-      for (const [id, p] of this.pending) {
-        p.reject(err);
-        this.pending.delete(id);
+      if (this.proc === proc) {
+        this.proc = null;
+        this.procModel = undefined;
       }
-      this.proc = null;
+      this.failActive("pi rpc subprocess closed before the turn settled");
     });
     this.proc = proc;
+    this.procModel = model;
     return proc;
   }
 
-  private resolveBinary(): string {
-    const envPath = process.env["PI_RPC_BIN"] ?? process.env["PI_BINARY"];
-    if (envPath && existsSync(envPath)) return envPath;
-    const home = homedir();
-    for (const dir of ["/usr/local/bin", "/usr/bin", `${home}/.local/bin`]) {
-      const p = resolve(dir, "pi");
-      if (existsSync(p)) return p;
+  private stopProc(): void {
+    const proc = this.proc;
+    this.proc = null;
+    this.procModel = undefined;
+    if (proc !== null) {
+      try {
+        proc.stdin?.end();
+      } catch {
+        // already gone
+      }
+      try {
+        proc.kill();
+      } catch {
+        // already gone
+      }
     }
-    throw new AgentError(
-      "binary_not_found",
-      "Cannot find `pi` on PATH. Set PI_RPC_BIN or PI_BINARY.",
-      "user",
-    );
   }
+
+  private resolveBinary(): string {
+    // Explicit env override first; otherwise the core PATH search covers
+    // pnpm (~/Library/pnpm/bin), homebrew and every other install layout.
+    const envPath = process.env["PI_RPC_BIN"] ?? process.env["PI_BINARY"];
+    if (envPath !== undefined && envPath !== "" && existsSync(envPath)) return envPath;
+    return resolveBinary("pi", "PI_RPC_BIN").path;
+  }
+
+  // --- protocol pump -----------------------------------------------------------
 
   private ingest(chunk: string): void {
     this.buffer += chunk;
@@ -128,79 +169,223 @@ export class PiRpcAgent implements Agent {
       const line = this.buffer.slice(0, nl).trim();
       this.buffer = this.buffer.slice(nl + 1);
       nl = this.buffer.indexOf("\n");
-      if (!line) continue;
+      if (line === "") continue;
+      let event: RpcEvent;
       try {
-        const parsed: unknown = JSON.parse(line);
-        if (isResponse(parsed)) {
-          const p = this.pending.get(parsed.id);
-          if (p) {
-            this.pending.delete(parsed.id);
-            p.resolve(parsed);
-          }
-        } else if (isEvent(parsed)) {
-          this.forwardEvent(parsed);
-        }
+        event = JSON.parse(line) as RpcEvent;
       } catch {
-        // ignore malformed lines
+        continue; // malformed line — skip, the turn carries on
       }
+      this.handleEvent(event);
     }
   }
 
-  private forwardEvent(ev: RpcEvent): void {
+  private handleEvent(event: RpcEvent): void {
     const at = new Date().toISOString();
-    const sessionId = String(ev["sessionId"] ?? "default");
-    switch (ev.type) {
-      case "message_update": {
-        const inner = ev["assistantMessageEvent"] as { type?: string; delta?: string } | undefined;
-        if (inner?.type === "text_delta" && typeof inner.delta === "string") {
-          this.collectedText += inner.delta;
-          this.emit(sessionId, { type: "assistant-text", content: inner.delta, at });
+
+    // The prompt command ACK: a rejection must fail the turn, or it hangs.
+    if (event.type === "response" && typeof event["id"] === "string") {
+      const pending = this.promptAcks.get(event["id"] as string);
+      if (pending !== undefined) {
+        this.promptAcks.delete(event["id"] as string);
+        if (event["success"] === false) {
+          pending.failed(
+            new AgentError("cli_error", `pi rejected the prompt: ${String(event["error"] ?? "unknown")}`, "tool"),
+          );
         }
-        break;
       }
-      case "tool_call":
-        this.emit(sessionId, {
+      return;
+    }
+
+    const active = this.active;
+    const emit = (e: AgentEvent): void => {
+      if (active === undefined) return;
+      this.emit(active.sessionId, e);
+    };
+    switch (event.type) {
+      case "tool_execution_start": {
+        emit({
           type: "tool-call",
-          name: String(ev["name"] ?? ""),
-          args: ev["args"],
+          name: String(event["toolName"] ?? "unknown"),
+          args: event["args"],
           at,
         });
-        break;
-      case "tool_result":
-        this.emit(sessionId, {
+        return;
+      }
+      case "tool_execution_end": {
+        emit({
           type: "tool-result",
-          name: String(ev["name"] ?? ""),
-          result: ev["result"],
+          name: String(event["toolName"] ?? "unknown"),
+          result: event["result"],
           at,
         });
-        break;
-      case "error":
-        this.emit(sessionId, { type: "error", message: String(ev["message"] ?? "unknown"), at });
-        break;
+        return;
+      }
+      case "message_update": {
+        // Streaming deltas live NESTED in assistantMessageEvent (rpc.md 938-996).
+        const inner = event["assistantMessageEvent"];
+        if (isRecord(inner) && inner["type"] === "text_delta" && typeof inner["delta"] === "string") {
+          emit({ type: "assistant-text", content: inner["delta"], at });
+        }
+        return;
+      }
+      case "message_end": {
+        const message = event["message"];
+        if (!isRecord(message)) return;
+        if (message["role"] === "assistant") {
+          const text = textFromParts(message["content"]).trim();
+          const stopReason = typeof message["stopReason"] === "string" ? message["stopReason"] : undefined;
+          const errorMessage = typeof message["errorMessage"] === "string" ? message["errorMessage"] : undefined;
+          if (active !== undefined && stopReason !== "toolUse" && text !== "") {
+            active.text.push(text);
+          }
+          if (active !== undefined) {
+            if (active.model === undefined && typeof message["model"] === "string") active.model = message["model"];
+            const usage = isRecord(message["usage"]) ? message["usage"] : undefined;
+            if (usage !== undefined) {
+              const asNumber = (key: string): number | undefined => {
+                const value = usage[key];
+                return typeof value === "number" ? value : undefined;
+              };
+              const input = asNumber("input");
+              const output = asNumber("output");
+              const reasoning = asNumber("reasoning");
+              active.usage = {
+                ...(input !== undefined ? { inputTokens: input } : {}),
+                ...(output !== undefined ? { outputTokens: output } : {}),
+                ...(reasoning !== undefined ? { reasoningTokens: reasoning } : {}),
+              };
+            }
+            if (stopReason === "error" || errorMessage !== undefined) {
+              active.errorMessage =
+                errorMessage ?? `pi stopped with stopReason=${stopReason ?? "error"}`;
+            }
+          }
+          if (stopReason !== "toolUse" && text !== "") {
+            emit({ type: "assistant-text", content: text, at });
+          }
+        }
+        return;
+      }
+      case "auto_retry_start": {
+        emit({ type: "error", message: `pi retrying (attempt ${String(event["attempt"] ?? "?")})`, at });
+        return;
+      }
+      case "agent_settled": {
+        if (active === undefined || active.finished) return;
+        active.finished = true;
+        const { sessionId, text, model, usage, errorMessage } = active;
+        this.active = undefined;
+        if (errorMessage !== undefined) {
+          this.emit(sessionId, { type: "error", message: errorMessage, at });
+          this.emit(sessionId, { type: "session-end", reason: "errored", at });
+          active.failed(new AgentError("cli_error", errorMessage, "tool"));
+          return;
+        }
+        this.emit(sessionId, { type: "session-end", reason: "completed", at });
+        active.settled({
+          status: "completed",
+          text: text.join("\n\n"),
+          sessionId,
+          durationMs: 0,
+          ...(model !== undefined ? { modelId: model, modelSource: "reported" as const } : {}),
+          ...(usage !== undefined ? { usage } : {}),
+        });
+        return;
+      }
       default:
-        break;
+        return;
     }
   }
 
-  private call(method: string, params?: unknown): Promise<RpcResponse> {
-    return new Promise<RpcResponse>((resolveP, rejectP) => {
-      const proc = this.start();
-      const id = this.nextId++;
-      this.pending.set(id, {
-        resolve: (r) => {
-          if (r.error) rejectP(new AgentError("rpc_error", r.error.message, "tool", { method }));
-          else resolveP(r);
+  private failActive(message: string): void {
+    const active = this.active;
+    if (active === undefined || active.finished) return;
+    active.finished = true;
+    this.active = undefined;
+    const error = new AgentError("rpc_closed", message, "internal");
+    this.emit(active.sessionId, { type: "error", message, at: new Date().toISOString() });
+    this.emit(active.sessionId, { type: "session-end", reason: "errored", at: new Date().toISOString() });
+    active.failed(error);
+  }
+
+  /** Run one prompt turn to `agent_settled`; resolves with the collected answer. */
+  private runTurn(
+    message: string,
+    model: string | undefined,
+    timeoutMs: number | undefined,
+  ): Promise<AgentResponse> {
+    // pi accepts ONE prompt at a time; overlap writes are rejected on the
+    // wire. Serialize turn starts so a second caller queues, not corrupts.
+    const run = this.turnQueue.then(() => this.runTurnInner(message, model, timeoutMs));
+    this.turnQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private runTurnInner(
+    message: string,
+    model: string | undefined,
+    timeoutMs: number | undefined,
+  ): Promise<AgentResponse> {
+    const proc = this.start(model);
+    this.turnSeq += 1;
+    const sessionId = `rpc-${this.turnSeq}`;
+    return new Promise<AgentResponse>((settle, fail) => {
+      let timer: NodeJS.Timeout | undefined;
+      this.active = {
+        sessionId,
+        text: [],
+        model: undefined,
+        usage: undefined,
+        errorMessage: undefined,
+        finished: false,
+        settled: (response) => {
+          if (timer !== undefined) clearTimeout(timer);
+          settle({ ...response, durationMs: Date.now() - startedAt });
         },
-        reject: (err) => rejectP(err),
+        failed: (error) => {
+          if (timer !== undefined) clearTimeout(timer);
+          fail(error);
+        },
+      };
+      const startedAt = Date.now();
+      this.emit(sessionId, { type: "session-start", sessionId, at: new Date().toISOString() });
+      this.emit(sessionId, { type: "user-prompt", content: message, at: new Date().toISOString() });
+      const ackId = `prompt-${sessionId}`;
+      this.promptAcks.set(ackId, {
+        settled: () => {},
+        failed: (error) => this.failActive(error.message),
       });
-      const line = `${JSON.stringify({ type: "request", id, method, params })}\n`;
+      const line = `${JSON.stringify({ id: ackId, type: "prompt", message })}\n`;
       try {
-        if (!proc.stdin?.write(line)) {
-          // backpressure — fall through; ingest handles responses
-        }
+        proc.stdin?.write(line);
       } catch (err) {
-        this.pending.delete(id);
-        rejectP(new AgentError("rpc_write_failed", (err as Error).message, "tool", { method }));
+        this.failActive(`pi rpc stdin write failed: ${(err as Error).message}`);
+        return;
+      }
+      if (timeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          const active = this.active;
+          if (active === undefined || active.finished || active.sessionId !== sessionId) return;
+          active.finished = true;
+          this.active = undefined;
+          try {
+            proc.stdin?.write(`${JSON.stringify({ type: "abort" })}\n`);
+          } catch {
+            // proc may be dead — nothing left to abort.
+          }
+          this.emit(sessionId, { type: "session-end", reason: "killed", at: new Date().toISOString() });
+          active.settled({
+            status: "timed-out",
+            text: active.text.join("\n\n"),
+            sessionId,
+            durationMs: Date.now() - startedAt,
+            meta: { partial: true },
+          });
+        }, timeoutMs);
       }
     });
   }
@@ -210,133 +395,79 @@ export class PiRpcAgent implements Agent {
   // ===========================================================================
 
   async prompt(prompt: string, opts: PromptOptions = {}): Promise<AgentResponse> {
-    const sessionId = opts.sessionId ?? `prompt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const start = Date.now();
-    try {
-      await this.call("prompt", { text: prompt, ...(opts.modelId ? { model: opts.modelId } : {}) });
-      this.emit(sessionId, { type: "session-end", reason: "completed", at: new Date().toISOString() });
-      return {
-        status: "completed",
-        text: this.collectText(),
-        durationMs: Date.now() - start,
-        ...(opts.modelId ? { modelId: opts.modelId, modelSource: "requested" as const } : {}),
-      };
-    } catch (err) {
-      this.emit(sessionId, {
-        type: "error",
-        message: (err as Error).message,
-        at: new Date().toISOString(),
-      });
-      this.emit(sessionId, { type: "session-end", reason: "errored", at: new Date().toISOString() });
-      throw err;
-    }
+    return await this.runTurn(prompt, opts.modelId, opts.timeoutMs);
   }
 
-  async resume(sessionId: string, prompt: string, opts: PromptOptions = {}): Promise<AgentResponse> {
-    const start = Date.now();
-    try {
-      await this.call("switch_session", { id: sessionId });
-      await this.call("follow_up", {
-        text: prompt,
-        ...(opts.modelId ? { model: opts.modelId } : {}),
-      });
-      this.emit(sessionId, { type: "session-end", reason: "completed", at: new Date().toISOString() });
-      return {
-        status: "completed",
-        text: this.collectText(),
-        sessionId,
-        durationMs: Date.now() - start,
-        ...(opts.modelId ? { modelId: opts.modelId, modelSource: "requested" as const } : {}),
-      };
-    } catch (err) {
-      this.emit(sessionId, {
-        type: "error",
-        message: (err as Error).message,
-        at: new Date().toISOString(),
-      });
-      this.emit(sessionId, { type: "session-end", reason: "errored", at: new Date().toISOString() });
-      throw err;
-    }
+  async resume(sessionId: string, _prompt: string, _opts: PromptOptions = {}): Promise<AgentResponse> {
+    throw unsupportedCapability(
+      "resume",
+      `pi-rpc keeps no sessions (--no-session); use the pi backend's own session files instead. (${sessionId})`,
+    );
   }
 
-  async listModels(_opts: PromptOptions = {}): Promise<ModelInfo[]> {
-    const r = await this.call("list_models");
-    const arr =
-      (
-        r.result as
-          | {
-              models?: Array<{ id: string; displayName?: string; provider?: string; contextWindow?: number }>;
-            }
-          | undefined
-      )?.models ?? [];
-    return arr.map((m) => ({
-      id: m.id,
-      displayName: m.displayName ?? m.id,
-      provider: m.provider ?? "pi",
-      contextWindow: m.contextWindow ?? 32768,
-      supportsTools: true,
-      supportsVision: false,
-    }));
+  async listModels(): Promise<ModelInfo[]> {
+    // pi picks models from its own catalog at spawn time (--model pattern);
+    // there is no rpc listing command, so we report the honest minimum.
+    return [];
   }
 
-  async listSessions(_opts: PromptOptions = {}): Promise<SessionInfo[]> {
-    try {
-      const r = await this.call("list_sessions");
-      const arr =
-        (
-          r.result as
-            | {
-                sessions?: Array<{
-                  id: string;
-                  createdAt?: string;
-                  lastUsedAt?: string;
-                  cwd?: string;
-                  messageCount?: number;
-                  summary?: string;
-                }>;
-              }
-            | undefined
-        )?.sessions ?? [];
-      return arr.map((s) => ({
-        id: s.id,
-        createdAt: s.createdAt ?? new Date().toISOString(),
-        lastUsedAt: s.lastUsedAt ?? new Date().toISOString(),
-        cwd: s.cwd ?? process.cwd(),
-        summary: s.summary ?? "",
-        messageCount: s.messageCount ?? 0,
-      }));
-    } catch {
-      return [];
-    }
+  async listSessions(): Promise<SessionInfo[]> {
+    // --no-session: pi keeps no sessions for this backend.
+    return [];
   }
 
   subscribe(sessionId: string, onEvent: (e: AgentEvent) => void): () => void {
     let set = this.subscribers.get(sessionId);
-    if (!set) {
+    if (set === undefined) {
       set = new Set();
       this.subscribers.set(sessionId, set);
     }
     set.add(onEvent);
     return () => {
       set?.delete(onEvent);
-      if (set && set.size === 0) this.subscribers.delete(sessionId);
+      if (set !== undefined && set.size === 0) this.subscribers.delete(sessionId);
     };
   }
 
-  async abort(_sessionId: string): Promise<void> {
-    try {
-      await this.call("abort");
-    } catch {
-      // best-effort: proc may be dead
+  async abort(sessionId: string): Promise<void> {
+    const proc = this.proc;
+    if (proc !== null) {
+      try {
+        proc.stdin?.write(`${JSON.stringify({ type: "abort" })}\n`);
+      } catch {
+        // proc may be dead — the turn fails through the close handler.
+      }
     }
-    this.emit(_sessionId, { type: "session-end", reason: "killed", at: new Date().toISOString() });
+    const active = this.active;
+    if (active !== undefined && active.sessionId === sessionId && !active.finished) {
+      // Settle the caller now — a later agent_settled is ignored via `finished`.
+      active.finished = true;
+      this.active = undefined;
+      this.emit(sessionId, { type: "session-end", reason: "killed", at: new Date().toISOString() });
+      active.settled({
+        status: "aborted",
+        text: active.text.join("\n\n"),
+        sessionId,
+        durationMs: 0,
+        meta: { partial: true },
+      });
+      return;
+    }
+    this.emit(sessionId, { type: "session-end", reason: "killed", at: new Date().toISOString() });
   }
 
   async send(_sessionId: string, message: string, kind: MidRunCommand = "steer"): Promise<void> {
-    if (kind === "follow_up") {
-      await this.call("follow_up", { text: message });
-    } else {
-      await this.call("steer", { text: message });
+    const proc = this.proc;
+    if (proc === null || proc.stdin === null) {
+      throw new AgentError("rpc_closed", "pi rpc subprocess is not running", "tool");
+    }
+    // rpc.md: steer queues the message for after the current assistant turn's
+    // tool calls; followUp waits for the agent to stop.
+    const line = `${JSON.stringify({ type: kind, message })}\n`;
+    try {
+      proc.stdin.write(line);
+    } catch (err) {
+      throw new AgentError("rpc_write_failed", (err as Error).message, "tool");
     }
   }
 
@@ -348,33 +479,25 @@ export class PiRpcAgent implements Agent {
   }
 
   async dispose(): Promise<void> {
-    if (this.proc) {
-      this.proc.kill();
-      this.proc = null;
-    }
-    // Reject all in-flight calls so callers don't hang
-    const err = new AgentError("disposed", "PiRpcAgent disposed before response", "internal");
-    for (const [, p] of this.pending) p.reject(err);
-    this.pending.clear();
+    this.stopProc();
+    this.failActive("PiRpcAgent disposed before the turn settled");
     this.subscribers.clear();
   }
 
   // ---------------------------------------------------------------------------
 
-  private collectText(): string {
-    const out = this.collectedText;
-    this.collectedText = "";
-    return out;
-  }
-
   private emit(sessionId: string, event: AgentEvent): void {
-    const set = this.subscribers.get(sessionId);
-    if (!set) return;
-    for (const cb of set) {
-      try {
-        cb(event);
-      } catch {
-        // ignore
+    // Same contract as the CLI backends: exact-session subscribers plus "*"
+    // (which receives everything, e.g. the stream compressor hub).
+    for (const key of [sessionId, "*"]) {
+      const set = this.subscribers.get(key);
+      if (set === undefined) continue;
+      for (const cb of set) {
+        try {
+          cb(event);
+        } catch {
+          // A broken subscriber must not break the turn.
+        }
       }
     }
   }

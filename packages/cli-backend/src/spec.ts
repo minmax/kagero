@@ -113,6 +113,14 @@ export interface AcpTransportSpec {
   configOptions?(ctx: PromptContext): readonly AcpConfigOption[];
   /** modeId for session/set_mode (kimi). Undefined = skip the call. */
   modeId?(ctx: PromptContext): string | undefined;
+  /**
+   * The CLI's request_permission optionIds for allow-once / allow-always.
+   * Different CLIs name them differently (claude: approve_once/approve_always,
+   * mcode: allow-once/allow-always) and most DENY unknown ids — an unmapped
+   * answer silently denies every tool call. Set it per CLI; absent = the
+   * claude-lineage default.
+   */
+  permissionOptions?: { readonly once: string; readonly always: string };
 }
 
 export interface CliSpec {

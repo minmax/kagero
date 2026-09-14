@@ -61,7 +61,6 @@ export class PiSdkAgent implements Agent {
   async init(): Promise<void> {
     if (this.session) return;
     try {
-      // @ts-expect-error: peer-dep is optional; only present if user installed it
       const mod = await import("@earendil-works/pi-coding-agent");
       const factory = (mod as { createAgentSession?: SdkFactory }).createAgentSession;
       if (typeof factory !== "function") {
