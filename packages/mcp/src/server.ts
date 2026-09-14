@@ -97,6 +97,7 @@ function runOptionFields() {
     approval_mode: z.enum(["default", "yolo"]).optional(),
     additional_dirs: z.array(z.string()).optional(),
     thinking_effort: z.string().optional(),
+    native_overrides: z.array(z.string()).optional(),
   };
 }
 
@@ -198,6 +199,7 @@ interface RunArgsLike {
   approval_mode?: "default" | "yolo" | undefined;
   additional_dirs?: string[] | undefined;
   thinking_effort?: string | undefined;
+  native_overrides?: string[] | undefined;
 
   workspace_create?: boolean | undefined;
   workspace_path?: string | undefined;
@@ -427,6 +429,7 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
     if (args.approval_mode !== undefined) draft.approvalMode = args.approval_mode;
     if (args.additional_dirs !== undefined) draft.additionalDirs = args.additional_dirs;
     if (args.thinking_effort !== undefined) draft.thinkingEffort = args.thinking_effort;
+    if (args.native_overrides !== undefined) draft.nativeOverrides = args.native_overrides;
 
     if (includeSessionId && args.session_id !== undefined) draft.sessionId = args.session_id;
     if (args.workspace_create === true) {

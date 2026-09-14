@@ -33,19 +33,38 @@ const codexSpec: CliSpec = {
     resumeCapable: true,
     args(ctx: PromptContext): string[] {
       const modelArgs = ctx.opts.modelId === undefined ? [] : ["--model", ctx.opts.modelId];
+      // Per-call config overrides (-c key=value, repeatable): effort maps to
+      // model_reasoning_effort (backend validates per model — gpt-6-astra
+      // rejects "minimal" with 400); extra overrides pass through verbatim
+      // (TOML values need quotes, e.g. web_search="live").
+      const effortArgs =
+        ctx.opts.thinkingEffort === undefined ? [] : ["-c", `model_reasoning_effort="${ctx.opts.thinkingEffort}"`];
+      const overrideArgs = (ctx.opts.nativeOverrides ?? []).flatMap((kv) => ["-c", kv]);
       if (ctx.mode === "resume" && ctx.sessionId !== undefined) {
         // resume has no -C/-s: cwd and sandbox are inherited from the session.
         // --json must ride along: without it the resume run prints human text
         // and the JSONL parser would find nothing. --skip-git-repo-check is
         // accepted by `exec resume` too; without it a resume outside a trusted
         // git repo fails with "Not inside a trusted directory".
-        return ["exec", "resume", ctx.sessionId, "--json", "--skip-git-repo-check", ...modelArgs, ctx.prompt];
+        return [
+          "exec",
+          "resume",
+          ctx.sessionId,
+          "--json",
+          "--skip-git-repo-check",
+          ...modelArgs,
+          ...effortArgs,
+          ...overrideArgs,
+          ctx.prompt,
+        ];
       }
       return [
         "exec",
         "--json",
         "--skip-git-repo-check",
         ...modelArgs,
+        ...effortArgs,
+        ...overrideArgs,
         ...(ctx.opts.approvalMode === "yolo" ? ["--dangerously-bypass-approvals-and-sandbox"] : []),
         ctx.prompt,
       ];

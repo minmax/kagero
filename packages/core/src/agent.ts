@@ -100,6 +100,11 @@ export interface PromptOptions {
   readonly additionalDirs?: readonly string[];
   /** Reasoning/thinking effort for the session (config option where the CLI supports it). */
   readonly thinkingEffort?: string;
+  /**
+   * Native per-run config overrides, verbatim: codex `-c key=value` pairs,
+   * dsh `--patch <file>` paths, etc. The spec decides how each is carried.
+   */
+  readonly nativeOverrides?: readonly string[];
 }
 
 /** Per-event payload for live observation. */

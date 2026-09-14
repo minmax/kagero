@@ -165,6 +165,11 @@ const dshSpec: CliSpec = {
       // Bridge grammar: --profile first, then the bridge flags, the positional
       // task LAST (the bridge's commander program takes `[task...]`).
       const args: string[] = ["--profile", "headless"];
+      // Per-run config overlays: native_overrides entries are --patch file
+      // paths (provider routes, tool toggles — anything in the plugin tree).
+      for (const patch of ctx.opts.nativeOverrides ?? []) {
+        args.push("--patch", patch);
+      }
       if (ctx.opts.modelId !== undefined) {
         args.push("--model", ctx.opts.modelId);
       }
