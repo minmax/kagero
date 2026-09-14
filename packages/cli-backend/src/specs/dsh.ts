@@ -4,7 +4,7 @@
  *
  * Interface facts (live probe reviews/dsh-real-interface.md, re-run 2026-09-12
  * against dsh 0.1.5-rc.1; flag grammar and JSON contract from the bridge repo
- * https://github.com/minmax/dsh-bridge — README.md, src/args.ts,
+ * dsh-headless-bridge (repo: see BRIDGE_REPO below) — README.md, src/args.ts,
  * src/output.ts):
  *  - Stock headless (`dsh --profile headless "<task>"`) is one positional task
  *    and only -h/--help. Our profile has dsh-headless-bridge installed, which
