@@ -87,7 +87,7 @@ src/
 │   ├── kimi.ts         # subprocess kimi --print
 │   └── mcode.ts        # subprocess mcode --print
 ├── mcp/
-│   └── server.ts       # MCP-сервер поверх Agent
+│   └── server.ts       # MCP server over the Agent contract
 ├── cli.ts              # CLI entry point
 └── index.ts            # public exports
 

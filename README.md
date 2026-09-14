@@ -1,192 +1,106 @@
-# kagero-mcp
+# kagero
 
-[![status](https://img.shields.io/badge/status-v0.1.1-blue.svg)](#)
-[![MCP protocol](https://img.shields.io/badge/MCP-2025--06--18-blue.svg)](https://modelcontextprotocol.io)
 [![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-**Kagero (陽炎)** — MCP-bait для agentic мира. TypeScript фреймворк с общим
-`Agent`-интерфейсом поверх:
+**Kagero** — one `Agent` interface over coding-agent CLIs, exposed as an MCP
+server and a CLI. Ten backends, ten honest tools, zero pretending: whatever a
+backend cannot do comes back as an explicit `[unsupported_capability]` error,
+never as a guess.
 
-- **`pi-sdk`** — in-process через `@earendil-works/pi-coding-agent` (peer-dep)
-- **`pi-rpc`** — через `pi --mode rpc` (subprocess)
-- **`dsh`** / **`qwen`** / **`grok`** / **`kimi`** / **`mcode`** — CLI-агенты
+## Backends
 
-Один интерфейс — разные backend'ы. Выбор через `KAGERO_BACKEND` env var.
+| backend | transport | binary |
+|---|---|---|
+| `pi-sdk` | in-process SDK (`@earendil-works/pi-coding-agent`, optional peer dep) | — |
+| `pi-rpc` | subprocess, `pi --mode rpc` | `pi` |
+| `claude` | subprocess, `claude -p --output-format stream-json` | `claude` |
+| `claude-stream` | long-lived subprocess, live `--input-format stream-json` protocol (steer/follow_up/interrupt) | `claude` |
+| `codex` | subprocess, `codex exec --json` | `codex` |
+| `dsh` | subprocess, `dsh --profile headless` (dsh-headless-bridge) | `dsh` |
+| `grok` | subprocess, grok ACP + streaming print | `grok` |
+| `kimi` | subprocess, `kimi acp` / print | `kimi` |
+| `mcode` | subprocess, `mcode acp` / `mcode exec` | `mcode` |
+| `qwen` | subprocess, `qwen --acp` / stream / print | `qwen` |
 
-> Это **тень** от `niwa` (настоящей agentic OS). Показывает форму, но
-> мастерство — за углом.
+Select with `KAGERO_BACKEND` or `kagero mcp --backend=<name>`; `kagero backends`
+lists what is registered.
 
-## Quickstart: choose your backend
-
-Перед первым запуском выберите backend. По умолчанию — `pi-sdk`, и для него
-**нужна** отдельная npm-зависимость:
-
-```bash
-# Если хотите pi-sdk (in-process, нужен peer-dep):
-npm install @earendil-works/pi-coding-agent
-
-# Или используйте CLI-backend, если бинарь уже стоит:
-export KAGERO_BACKEND=dsh     # или qwen / grok / kimi / mcode / pi-rpc
-kagero prompt "List the files in the current directory"
-```
-
-Если `pi-sdk` не установлен, а `KAGERO_BACKEND` указывает на него, вы получите
-ошибку `Cannot find module '@earendil-works/pi-coding-agent'`. Чтобы этого
-избежать, либо поставьте peer-dep, либо явно выберите один из CLI-backend'ов,
-бинарь которого у вас уже есть (`which dsh` / `which qwen` / ...).
-
-Полный список доступных backend'ов и активный по умолчанию:
-
-```bash
-kagero backends
-```
-
-## Архитектура
-
-```
-kagero (Agent interface)
-  ├─ pi-sdk  (in-process, @earendil-works/pi-coding-agent)
-  ├─ pi-rpc  (subprocess, pi --mode rpc)
-  ├─ dsh     (subprocess, dsh --print)
-  ├─ qwen    (subprocess, qwen --print)
-  ├─ grok    (subprocess, grok --print)
-  ├─ kimi    (subprocess, kimi --print)
-  └─ mcode   (subprocess, mcode --print)
-
-        ↓
-MCP server (stdio)         CLI (kagero prompt/resume/...)
-```
-
-## Установка
+## Install
 
 ```bash
 npm install kagero-mcp
-# или без install
+# or run without installing
 npx kagero-mcp
 ```
 
-Для использования `pi-sdk` backend'а поставьте peer-dep:
+The `pi-sdk` backend needs its optional peer dependency:
 
 ```bash
 npm install @earendil-works/pi-coding-agent
 ```
 
-Без этого `KAGERO_BACKEND=pi-sdk` (по умолчанию) работать не будет — см. секцию
-[Quickstart](#quickstart-choose-your-backend) выше.
-
-## Использование
+## Usage
 
 ### CLI
 
 ```bash
-# One-shot prompt (по умолчанию pi-sdk)
-kagero prompt "List the files in the current directory"
-
-# Другой backend
-KAGERO_BACKEND=dsh kagero prompt "List the files"
-
-# Список доступных backend'ов
-kagero backends
-
-# Список моделей активного backend'а
-kagero models
-
-# Список сессий
-kagero sessions
+kagero prompt "List the files in the current directory"   # one-shot
+KAGERO_BACKEND=mcode kagero prompt "…"                    # pick a backend
+kagero backends                                           # registered backends
+kagero models                                             # active backend models
+kagero sessions                                           # persistent sessions
+kagero mcp --backend=mcode                                # MCP server over stdio
 ```
 
-### MCP server
+### MCP tools
 
-```bash
-kagero mcp              # uses default backend
-kagero mcp --backend=dsh
+`prompt`, `resume`, `models`, `sessions`, `history`, `send` (steer /
+follow_up), `subscribe`, `unsubscribe`, `abort`, `backends` — plus the
+optional `watch` tool when the compressor is configured.
+
+### History
+
+`history` returns a compact normalized view, paged from the newest end
+(`page` / `page_size`, entry indexes are global across pages) with a
+full-log pointer. Readers for pi, qwen, grok, kimi, mcode (MiniMax Code),
+claude, codex and dsh parse each CLI's on-disk session logs, capture
+thinking blocks and merge tool results into their calls.
+
+### Session compression (optional)
+
+Set `KAGERO_COMPRESS_BACKEND` (and optionally `KAGERO_COMPRESS_MODEL`) to
+enable the `watch` tool and run reports: agent event streams are compressed
+by a cheap second agent into anchored, machine-validated digests — per-move
+blocks with distilled reasoning, a rolling checkpoint and a status verdict.
+Compressed state persists across restarts in a crash-safe journal
+(`~/.kagero/watch/`).
+
+## Architecture
+
+```
+Agent interface (@kagero/core)
+  ├─ CliSpecAgent (@kagero/cli-backend) — spec-driven print/ACP transports,
+  │    history readers, stream-json parsers
+  ├─ PiSdkAgent / PiRpcAgent (@kagero/pi-backend)
+  ├─ ClaudeStreamAgent (@kagero/cli-backend) — live stream-json protocol
+  └─ createKageroMcpServer (@kagero/mcp) — MCP factory over any registry
 ```
 
-Tools exposed:
-- `kagero_prompt` — one-shot prompt
-- `kagero_resume` — continue a session
-- `kagero_models` — list models
-- `kagero_sessions` — list sessions
-- `kagero_subscribe` — subscribe to live events (returns a `subId`)
-- `kagero_unsubscribe` — release a subscription by `subId`
-- `kagero_abort` — abort an in-flight run
-- `kagero_backends` — list available backends
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full contract.
 
-Подписки на live-события идут через стандартный MCP `notifications/message`
-(MCP 2025-06-18). Каждое событие — `{ kind: "agent_event", subId, sessionId, event }`.
+## Security & behavior
 
-## Безопасность и поведение
+- **Strict schemas.** Every tool input is enforced with
+  `z.object(...).strict()`; unknown fields are rejected before they reach a
+  backend.
+- **Honest statuses.** Runs end `completed`, `aborted`, `timed-out` or with
+  the CLI's own error — a killed run is never success.
+- **Fail-closed permissions.** Live transports answer reverse permission
+  requests with an explicit deny; nothing is auto-approved headlessly.
+- **No resource leaks.** Process groups are killed through a SIGTERM → grace
+  → SIGKILL ladder; ACP clients outlive single runs and are disposed on
+  shutdown.
 
-- **Schema validation (strict mode).** Все tool-схемы объявлены через
-  `z.object(...).strict()` — это превращает `inputSchema` из косметики в
-  реальный контракт: неизвестные поля отбрасываются с ошибкой до того, как
-  запрос дойдёт до backend'а.
-- **`process.env` passthrough.** CLI-backend'ы запускаются через
-  `spawn(..., { env: process.env })` — subprocess видит всё окружение
-  родителя (включая `ANTHROPIC_API_KEY` и т.п.). Если ваш MCP-хост кладёт
-  секреты в env kagero-процесса, они будут видны и subprocess'ам. Если это
-  нежелательно — запускайте kagero в sandbox-окружении.
-- **stdio-only MCP.** Сервер слушает только stdin/stdout — никакой сетевой
-  поверхности. Это безопасно по умолчанию: kagero-mcp нельзя случайно
-  выставить в сеть.
-- **Resource protection.** Subprocess'ы получают `proc.unref()` (не держат
-  event loop родителя) и 50MB cap на stdout/stderr (защита от OOM при
-  runaway output).
+## License
 
-### As a library
-
-```ts
-import { select } from "kagero-mcp";
-
-const agent = await select("dsh");
-const res = await agent.prompt("Hello, world!");
-console.log(res.text);
-```
-
-## Конфигурация (env)
-
-| Variable | Default | Назначение |
-|----------|---------|------------|
-| `KAGERO_BACKEND` | `pi-sdk` | Какой backend активен |
-| `DSH_MCP_BIN` / `DSH_BINARY` | (PATH) | Путь к `dsh` |
-| `QWEN_MCP_BIN` | (PATH) | Путь к `qwen` |
-| `GROK_MCP_BIN` | (PATH) | Путь к `grok` |
-| `KIMI_MCP_BIN` | (PATH) | Путь к `kimi` |
-| `MCODE_MCP_BIN` | (PATH) | Путь к `mcode` |
-| `PI_RPC_BIN` / `PI_BINARY` | (PATH) | Путь к `pi` для RPC-режима |
-
-## Архитектура
-
-`src/agent.ts` — общий интерфейс (`Agent`, `AgentEvent`, `AgentResponse`).
-`src/registry.ts` — `select(name) → Agent`, ленивая загрузка backend'ов.
-`src/backends/base.ts` — общая логика для CLI-backend'ов (spawn, signal,
-   timeout). Каждый CLI backend (dsh, qwen, ...) наследует и реализует
-   `buildArgs()` + `parseModels()`.
-`src/backends/pi-sdk.ts` — in-process через dynamic import peer-dep.
-`src/backends/pi-rpc.ts` — JSON-RPC через stdio к `pi --mode rpc`.
-`src/mcp/server.ts` — MCP-сервер с 8 tools (см. список выше).
-`src/cli.ts` — CLI entry point.
-
-## Разработка
-
-```bash
-git clone https://github.com/minmax/kagero
-cd kagero
-npm install
-npm run build        # → dist/
-npm test             # 26 tests (unit + integration, real subprocess + smart fake)
-npm run check        # biome + tsc
-```
-
-## Эстетика
-
-`kagero` (陽炎 / かげろう) — японское слово с тремя слоями значений:
-- **heat haze** — марево, дрожание воздуха над раскалённой землёй
-- **mayfly** — подёнка, символ мимолётности (蜻蛉日記 — классический дневник X века)
-- **gossamer** — прозрачный, как шёлк на просвет
-
-Это bait: видишь форму, тянешь руку — нет. Иди в сад (niwa) за настоящим.
-
-## Лицензия
-
-[MIT](LICENSE) © Niwa Labs.
+[MIT](LICENSE)
