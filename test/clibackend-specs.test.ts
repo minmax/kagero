@@ -395,7 +395,7 @@ describe("mcode spec", () => {
     );
     expect(options).toEqual([
       { configId: "permissionMode", value: "bypassPermissions" },
-      { configId: "model", value: "m" },
+      { configId: "model", value: "m:m:u" },
     ]);
     expect(mcodeSpec.acp?.configOptions?.(ctx({ prompt: "x" }))).toEqual([]);
   });
