@@ -34,6 +34,21 @@ function mcodePermissionArgs(approvalMode: "default" | "yolo" | undefined): stri
   return approvalMode === "yolo" ? ["--permission", "full"] : [];
 }
 
+
+/**
+ * Convert our public model id ("provider/model" or "provider/model#variant")
+ * into mcode's ACP model-option wire record (chunk run-acp-command: tr/Vg).
+ */
+export function mcodeModelOptionValue(modelId: string): string {
+  const [modelPart = modelId, variant] = modelId.split("#", 2);
+  const separator = modelPart.indexOf("/");
+  if (separator === -1) return `m:${encodeURIComponent(modelPart)}:u`;
+  const provider = modelPart.slice(0, separator);
+  const model = modelPart.slice(separator + 1);
+  const variantSuffix = variant === undefined ? "u" : `v:${encodeURIComponent(variant)}`;
+  return `m:${encodeURIComponent(provider)}:${encodeURIComponent(model)}:${variantSuffix}`;
+}
+
 const mcodeSpec: CliSpec = {
   name: "mcode",
   binary: "mcode",
@@ -79,7 +94,10 @@ const mcodeSpec: CliSpec = {
         options.push({ configId: "permissionMode", value: permissionMode });
       }
       if (ctx.opts.modelId !== undefined) {
-        options.push({ configId: "model", value: ctx.opts.modelId });
+        // ACP `model` option value is a compact provider:model[:variant] record
+        // ("m:<enc(provider)>:<enc(model)>:u", variant ":v:<enc(variant)>") —
+        // a bare "provider/model" is rejected with -32602 (live-probed).
+        options.push({ configId: "model", value: mcodeModelOptionValue(ctx.opts.modelId) });
       }
       return options;
     },
