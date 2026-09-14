@@ -89,6 +89,9 @@ const grokSpec: CliSpec = {
   },
 
   acp: {
+    // Non-destructive native steer: x.ai/interject merges text into the
+    // running turn at its next safe point (idle → front-of-queue prompt).
+    nativeSteer: "x.ai/interject",
     args: ["agent"],
     protocolVersion: "1",
     extraArgs: (ctx) => [

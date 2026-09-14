@@ -58,6 +58,10 @@ export interface AcpClientOptions {
    * Typically "approve_always" or "approve_once". Default "approve_once".
    */
   readonly permissionOption?: string;
+  /** Extra `_meta` merged into initialize `clientCapabilities` — extension gates (e.g. mcode "minimax-code/extensions"). */
+  readonly clientCapabilitiesMeta?: Record<string, unknown>;
+  /** Extra `additionalDirectories` sent with session/new (kimi honors on create). */
+  readonly additionalDirectories?: readonly string[];
   /** Timeout for the initialize / session-new / load handshake. Default 15000. */
   readonly handshakeTimeoutMs?: number;
   readonly clientInfo?: { readonly name: string; readonly version: string };
@@ -76,6 +80,8 @@ export interface AcpConfigOption {
 }
 
 export interface AcpSessionConfig {
+  /** Extra tool-access directories (kimi honors on session/new). */
+  readonly additionalDirectories?: readonly string[];
   /** Default []. */
   readonly mcpServers?: readonly unknown[];
   /** Sent as `_meta` on session/new and session/load. */
@@ -301,10 +307,22 @@ export class AcpClient {
       {
         protocolVersion: this.protocolVersion,
         clientInfo: this.opts.clientInfo ?? { name: DEFAULT_CLIENT_NAME, version: DEFAULT_CLIENT_VERSION },
-        clientCapabilities: {},
+        clientCapabilities:
+          this.opts.clientCapabilitiesMeta === undefined
+            ? {}
+            : { _meta: this.opts.clientCapabilitiesMeta },
       },
       { timeoutMs: timeoutMs ?? this.handshakeTimeoutMs, label: "the initialize handshake" },
     );
+  }
+
+  /**
+   * Raw native RPC against the live ACP agent (allowlisted by the caller):
+   * `session/list`, `session/fork`, extension methods (`mcode/session/steer`,
+   * grok `x.ai/*`), etc. Same wire path as every internal call.
+   */
+  async nativeRequest(method: string, params: RpcRecord, timeoutMs?: number): Promise<RpcRecord> {
+    return await this.request(method, params, { timeoutMs: timeoutMs ?? 120_000, label: method });
   }
 
   /** session/new → sessionId, then modeId / configOptions applied in order. */
@@ -314,6 +332,9 @@ export class AcpClient {
       cwd: this.opts.cwd,
       mcpServers: config.mcpServers ?? [],
     };
+    if (config.additionalDirectories !== undefined && config.additionalDirectories.length > 0) {
+      params["additionalDirectories"] = config.additionalDirectories;
+    }
     if (config.meta !== undefined) params["_meta"] = config.meta;
     const created = await this.request("session/new", params, { timeoutMs: budget, label: "session/new" });
     const reported = created["sessionId"];

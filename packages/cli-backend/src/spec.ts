@@ -121,6 +121,23 @@ export interface AcpTransportSpec {
    * claude-lineage default.
    */
   permissionOptions?: { readonly once: string; readonly always: string };
+  /**
+   * `_meta` merged into initialize clientCapabilities — the extension gate
+   * (mcode: "minimax-code/extensions"; without it extension notifications
+   * and methods are not offered).
+   */
+  clientCapabilitiesMeta?: Record<string, unknown>;
+  /** Extra tool-access directories passed on session/new (kimi honors on create). */
+  readonly additionalDirectories?: boolean;
+  /** Native ACP methods exposed through Agent.nativeRequest (allowlist). */
+  readonly nativeMethods?: readonly string[];
+  /**
+   * Native mid-run message methods, tried before the generic fallbacks:
+   * steer replaces cancel+reprompt (mcode `mcode/session/steer`, grok
+   * `x.ai/interject`), follow_up replaces the bare notification.
+   */
+  readonly nativeSteer?: string;
+  readonly nativeFollowUp?: string;
 }
 
 export interface CliSpec {

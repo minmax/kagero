@@ -329,6 +329,10 @@ export class CliSpecAgent implements Agent {
         if (options === undefined) return ctx.opts.approvalMode === "yolo" ? "approve_always" : "approve_once";
         return ctx.opts.approvalMode === "yolo" ? options.always : options.once;
       })(),
+      ...(this.spec.acp?.clientCapabilitiesMeta === undefined
+        ? {}
+        : { clientCapabilitiesMeta: this.spec.acp.clientCapabilitiesMeta }),
+      ...(ctx.opts.additionalDirs === undefined ? {} : { additionalDirectories: ctx.opts.additionalDirs }),
     });
     handle.client = client;
 
@@ -490,6 +494,30 @@ export class CliSpecAgent implements Agent {
 
   // --- live control -----------------------------------------------------------------
 
+
+  /** Native methods exposed over the live ACP channel (spec allowlist). */
+  get nativeMethods(): readonly string[] | undefined {
+    return this.spec.acp?.nativeMethods;
+  }
+
+  /** Raw native RPC bound to the session's live ACP client (spec allowlist enforced). */
+  async nativeRequest(sessionId: string, method: string, params: Record<string, unknown>): Promise<unknown> {
+    const allow = this.spec.acp?.nativeMethods;
+    if (allow !== undefined && !allow.includes(method)) {
+      throw new AgentError(
+        "unsupported_capability",
+        `${this.spec.name}: native method "${method}" is not allowlisted`,
+        "user",
+        { method },
+      );
+    }
+    const client = this.acpClients.get(sessionId) ?? this.findBySession(sessionId)?.client ?? null;
+    if (client === null) {
+      throw new AgentError("session_not_found", `${this.spec.name}: no live ACP session "${sessionId}" for a native call`, "user", { sessionId });
+    }
+    return await client.nativeRequest(method, { sessionId, ...params });
+  }
+
   subscribe(sessionId: string, onEvent: (e: AgentEvent) => void): () => void {
     let set = this.listeners.get(sessionId);
     if (set === undefined) {
@@ -521,6 +549,18 @@ export class CliSpecAgent implements Agent {
         kind === "steer" ? "steer" : "followUp",
         `no live ACP session for "${sessionId}" — mid-run messages need an ACP run.`,
       );
+    }
+    // NATIVE mid-run message methods first (mcode steer, grok x.ai/interject):
+    // non-destructive — no cancel+reprompt, no work discarded.
+    const nativeSteerMethod = this.spec.acp?.nativeSteer;
+    const nativeFollowUpMethod = this.spec.acp?.nativeFollowUp;
+    if (kind === "steer" && nativeSteerMethod !== undefined) {
+      await client.nativeRequest(nativeSteerMethod, { sessionId, text: message }, 30_000);
+      return;
+    }
+    if (kind === "follow_up" && nativeFollowUpMethod !== undefined) {
+      await client.nativeRequest(nativeFollowUpMethod, { sessionId, text: message }, 30_000);
+      return;
     }
     if (kind === "steer") {
       client.steer(message);

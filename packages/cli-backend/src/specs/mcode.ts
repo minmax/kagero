@@ -87,6 +87,31 @@ const mcodeSpec: CliSpec = {
     // mcode maps any other request_permission optionId to DENY
     // (run-acp-command chunk: allow-once → allowOnce, else deny).
     permissionOptions: { once: "allow-once", always: "allow-always" },
+    // Extension gate: without it mcode offers no steer/queue/goal/delegation
+    // methods or notifications (chunk run-acp-command: mo(de) reads
+    // clientCapabilities._meta["minimax-code/extensions"]).
+    clientCapabilitiesMeta: { "minimax-code/extensions": { version: 1, notifications: true } },
+    nativeSteer: "mcode/session/steer",
+    nativeFollowUp: "mcode/session/queue/enqueue",
+    nativeMethods: [
+      "session/list",
+      "session/fork",
+      "session/resume",
+      "session/close",
+      "session/activate",
+      "mcode/session/steer",
+      "mcode/session/queue/list",
+      "mcode/session/queue/enqueue",
+      "mcode/session/queue/update",
+      "mcode/session/queue/delete",
+      "mcode/session/queue/steer",
+      "mcode/session/goal/get",
+      "mcode/session/goal/create",
+      "mcode/session/goal/patch",
+      "mcode/session/goal/clear",
+      "mcode/session/delegation/get",
+      "mcode/session/delegation/stop",
+    ],
     configOptions: (ctx): AcpConfigOption[] => {
       const options: AcpConfigOption[] = [];
       const permissionMode = mcodeAcpPermissionMode(ctx.opts.approvalMode);

@@ -96,6 +96,8 @@ export interface PromptOptions {
   readonly sessionId?: string;
   /** Raw stdout chunks as they arrive (print transports; best-effort). */
   readonly onStream?: (chunk: string) => void;
+  /** Extra tool-access directories for the session (ACP newSession; kimi honors). */
+  readonly additionalDirs?: readonly string[];
 }
 
 /** Per-event payload for live observation. */
@@ -220,6 +222,16 @@ export interface Agent {
 
   /** Abort an in-flight run. Idempotent. */
   abort(sessionId: string): Promise<void>;
+
+  /**
+   * Raw native call into a live session (allowlisted per backend): extension
+   * methods like `mcode/session/steer`, `x.ai/interject`, `session/list`.
+   * Present only on backends with a live native channel.
+   */
+  nativeRequest?(sessionId: string, method: string, params: Record<string, unknown>): Promise<unknown>;
+
+  /** Native methods this backend exposes through nativeRequest. */
+  readonly nativeMethods?: readonly string[] | undefined;
 
   /** Cleanup. */
   dispose(): Promise<void>;
