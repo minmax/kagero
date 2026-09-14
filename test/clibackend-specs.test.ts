@@ -176,8 +176,6 @@ describe("claude spec", () => {
     );
     expect(args).toEqual([
       "-p",
-      "--",
-      "hi there",
       "--output-format",
       "stream-json",
       "--model",
@@ -185,12 +183,14 @@ describe("claude spec", () => {
       "--max-turns",
       "3",
       "--dangerously-skip-permissions",
+      "--",
+      "hi there",
     ]);
   });
 
   it("adds nothing for approval default and no limits", () => {
     const args = claudeSpec.print?.args(ctx({ prompt: "hi" }));
-    expect(args).toEqual(["-p", "--", "hi", "--output-format", "stream-json"]);
+    expect(args).toEqual(["-p", "--output-format", "stream-json", "--", "hi"]);
   });
 
   it("resumes with --resume <id>", () => {

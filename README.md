@@ -3,7 +3,7 @@
 [![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 **Kagero** — one `Agent` interface over coding-agent CLIs, exposed as an MCP
-server and a CLI. Ten backends, ten honest tools, zero pretending: whatever a
+server and a CLI. Ten backends, seven honest tools, zero pretending: whatever a
 backend cannot do comes back as an explicit `[unsupported_capability]` error,
 never as a guess.
 
@@ -54,9 +54,14 @@ kagero mcp --backend=mcode                                # MCP server over stdi
 
 ### MCP tools
 
-`prompt`, `resume`, `models`, `sessions`, `history`, `send` (steer /
-follow_up), `subscribe`, `unsubscribe`, `abort`, `backends` — plus the
-optional `watch` tool when the compressor is configured.
+`run` (fresh prompt, or continue a session via `session_id`; blocking or
+`run_in_background`), `send_message` (steer / follow_up / abort),
+`task_list`, `task_output`, `task_stop` (the background-run registry),
+`history`, `info`.
+
+A background `run` returns `{task_id, status: "running"}` immediately; when it
+finishes a `task-completed` logging notification announces the outcome and
+`task_output` returns the final result.
 
 ### History
 
@@ -69,11 +74,12 @@ thinking blocks and merge tool results into their calls.
 ### Session compression (optional)
 
 Set `KAGERO_COMPRESS_BACKEND` (and optionally `KAGERO_COMPRESS_MODEL`) to
-enable the `watch` tool and run reports: agent event streams are compressed
-by a cheap second agent into anchored, machine-validated digests — per-move
-blocks with distilled reasoning, a rolling checkpoint and a status verdict.
-Compressed state persists across restarts in a crash-safe journal
-(`~/.kagero/watch/`).
+enable run reports and the compressed live stream: agent event streams are
+compressed by a cheap second agent into anchored, machine-validated digests —
+per-move blocks with distilled reasoning, a rolling checkpoint and a status
+verdict. `history` prepends the digest header when one exists and
+`task_output` (`include_blocks`) returns the compressed blocks. Compressed
+state persists across restarts in a crash-safe journal (`~/.kagero/watch/`).
 
 ## Architecture
 

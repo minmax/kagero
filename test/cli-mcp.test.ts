@@ -131,7 +131,7 @@ afterAll(() => {
 });
 
 describe.skipIf(!existsSync(CLI))("kagero mcp over stdio (dist/cli.js)", () => {
-  it("completes initialize and advertises the ten kagero_* tools", { timeout: 15_000 }, async () => {
+  it("completes initialize and advertises the seven kagero_* tools", { timeout: 15_000 }, async () => {
     if (!fake) fake = makeFakeBin();
     const client = new McpClient({ DSH_BIN: fake.bin });
     try {
@@ -141,28 +141,25 @@ describe.skipIf(!existsSync(CLI))("kagero mcp over stdio (dist/cli.js)", () => {
       const list = await client.call("tools/list");
       const tools = (list.result?.["tools"] as Array<{ name: string }>) ?? [];
       expect(tools.map((t) => t.name).sort()).toEqual([
-        "kagero_abort",
-        "kagero_backends",
         "kagero_history",
-        "kagero_models",
-        "kagero_prompt",
-        "kagero_resume",
-        "kagero_send",
-        "kagero_sessions",
-        "kagero_subscribe",
-        "kagero_unsubscribe",
+        "kagero_info",
+        "kagero_run",
+        "kagero_send_message",
+        "kagero_task_list",
+        "kagero_task_output",
+        "kagero_task_stop",
       ]);
     } finally {
       client.close();
     }
   });
 
-  it("kagero_backends lists all nine backends with the requested default", { timeout: 15_000 }, async () => {
+  it("kagero_info lists all nine backends with the requested default", { timeout: 15_000 }, async () => {
     if (!fake) fake = makeFakeBin();
     const client = new McpClient({ DSH_BIN: fake.bin });
     try {
       await client.handshake();
-      const call = await client.callTool("kagero_backends");
+      const call = await client.callTool("kagero_info");
       expect(call.result?.["isError"]).toBeUndefined();
       const text = client.textOf(call);
       for (const name of ["claude", "codex", "dsh", "grok", "kimi", "mcode", "pi-rpc", "pi-sdk", "qwen"]) {
@@ -174,14 +171,14 @@ describe.skipIf(!existsSync(CLI))("kagero mcp over stdio (dist/cli.js)", () => {
     }
   });
 
-  it("kagero_prompt runs the substituted binary (backend override) and returns its text", {
+  it("kagero_run runs the substituted binary (backend override) and returns its text", {
     timeout: 15_000,
   }, async () => {
     if (!fake) fake = makeFakeBin();
     const client = new McpClient({ DSH_BIN: fake.bin, FAKE_CLI_MODE: "dsh" });
     try {
       await client.handshake();
-      const call = await client.callTool("kagero_prompt", { prompt: "hello MCP", backend: "dsh" });
+      const call = await client.callTool("kagero_run", { prompt: "hello MCP", backend: "dsh" });
       expect(call.result?.["isError"]).toBeUndefined();
       expect(client.textOf(call)).toBe("hello MCP");
       expect(call.result?.["_meta"]).toMatchObject({ status: "completed" });

@@ -1,6 +1,10 @@
-// Tests for the kagero_watch tool: raw fallback, compressor invocation with
-// session reuse (prefix cache), cursor paging, validation-repair fallback, and
-// honest degradation when the compressor reply is broken.
+// Tests for the watch compressor surface after the 7-tool rework: the
+// `${prefix}_watch` tool is gone — its polling loop lives on as the exported
+// handleWatch (tested directly below), while run replies carry the session
+// report, kagero_history prepends the digest header and kagero_task_output
+// can include the compressed blocks. Coverage kept: raw fallback, compressor
+// invocation with session reuse (prefix cache), cursor paging,
+// validation-repair fallback, honest degradation on broken replies.
 
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -9,7 +13,9 @@ import {
   type Agent,
   type AgentCapabilities,
   type AgentResponse,
+  type BackendRegistry,
   createRegistry,
+  type DigestOutput,
   type HistoryEntry,
   type HistoryOptions,
   type HistoryResult,
@@ -22,6 +28,8 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it } from "vitest";
 import { createKageroMcpServer } from "../packages/mcp/src/index.js";
+import { handleWatch, type WatchConfig, type WatchDeps } from "../packages/mcp/src/watch.js";
+import { loadWatchState, saveWatchState } from "../packages/mcp/src/watch-state.js";
 
 function fullCapabilities(): AgentCapabilities {
   return {
@@ -46,6 +54,26 @@ function entry(index: number, text: string, extra: Partial<HistoryEntry> = {}): 
     index,
     role: extra.role ?? "assistant",
     text,
+  };
+}
+
+/** A valid pass-1 contract output, for planting journal state in tests. */
+function digestOutput(blocks = 1): DigestOutput {
+  return {
+    blocks: Array.from({ length: blocks }, (_, i) => ({
+      turnIndex: i + 1,
+      anchor: { fromLine: (i + 1) * 3, toLine: (i + 1) * 3 + 2 },
+      action: `move ${i + 1} compressed`,
+      thoughts: [],
+    })),
+    digest: { goal: "test goal", currentBelief: "test belief", openHypotheses: [] },
+    report: {
+      status: "working",
+      progress: "halfway through",
+      next: "continuing",
+      rejected: [],
+      leftOpen: [],
+    },
   };
 }
 
@@ -166,15 +194,14 @@ class CompressorAgent implements Agent {
 
 interface Harness {
   client: Client;
+  registry: BackendRegistry;
   original: HistoryAgent;
   compressor: CompressorAgent;
   stateDir: string;
 }
 
 async function makeHarness(
-  watchConfig:
-    | { backend: string; modelId?: string; maxWaitMs: number; rawThresholdChars: number }
-    | undefined,
+  watchConfig: WatchConfig | undefined,
   stateDir: string = mkdtempSync(join(tmpdir(), "kagero-watch-state-")),
 ): Promise<Harness> {
   process.env["KAGERO_WATCH_STATE_DIR"] = stateDir;
@@ -193,7 +220,7 @@ async function makeHarness(
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "test-client", version: "0.0.0" });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-  return { client, original, compressor, stateDir };
+  return { client, registry, original, compressor, stateDir };
 }
 
 async function call(client: Client, name: string, args: Record<string, unknown>): Promise<CallToolResult> {
@@ -206,34 +233,55 @@ function textOf(result: CallToolResult): string {
   return result.content.map((block) => (block.type === "text" ? block.text : "")).join("\n");
 }
 
-const WATCH_CONFIG = { backend: "cheap", maxWaitMs: 1_000, rawThresholdChars: 200 };
+function jsonOf(result: CallToolResult): Record<string, unknown> {
+  return JSON.parse(textOf(result)) as Record<string, unknown>;
+}
 
-describe("kagero_watch", () => {
-  it("is not registered when no watch config is provided", async () => {
-    const { client } = await makeHarness(undefined);
-    const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name)).not.toContain("kagero_watch");
+/** Deps for a direct handleWatch poll against the harness registry. */
+function watchDeps(h: Harness, config: WatchConfig): WatchDeps {
+  return {
+    selectAgent: (backend) => h.registry.select(backend ?? "orig"),
+    defaultBackend: "orig",
+    config,
+  };
+}
+
+const WATCH_CONFIG: WatchConfig = { backend: "cheap", maxWaitMs: 1_000, rawThresholdChars: 200 };
+
+describe("kagero tool surface with the watch compressor", () => {
+  it("registers exactly the seven tools, with or without compressor config", async () => {
+    const expected = [
+      "kagero_history",
+      "kagero_info",
+      "kagero_run",
+      "kagero_send_message",
+      "kagero_task_list",
+      "kagero_task_output",
+      "kagero_task_stop",
+    ];
+    for (const config of [undefined, WATCH_CONFIG]) {
+      const h = await makeHarness(config);
+      const { tools } = await h.client.listTools();
+      expect(tools.map((t) => t.name).sort()).toEqual(expected);
+      expect(tools.map((t) => t.name)).not.toContain("kagero_watch");
+    }
   });
+});
 
-  it("is registered when a watch config is provided", async () => {
-    const { client } = await makeHarness(WATCH_CONFIG);
-    const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name)).toContain("kagero_watch");
-  });
-
+describe("handleWatch (the old watch tool loop, now a library entry point)", () => {
   it("returns the raw delta below the threshold and advances the cursor", async () => {
     const h = await makeHarness(WATCH_CONFIG);
     h.original.entries.push(entry(1, "tiny"));
-    const first = await call(h.client, "kagero_watch", { session_id: "s1" });
-    expect(first.isError).toBeFalsy();
-    expect(textOf(first)).toContain("below the compression threshold");
-    expect(textOf(first)).toContain("#1 asst");
-    expect(textOf(first)).toContain("@L3");
+    const first = await handleWatch(watchDeps(h, WATCH_CONFIG), { session_id: "s1" });
+    expect(first.isError).toBe(false);
+    expect(first.text).toContain("below the compression threshold");
+    expect(first.text).toContain("#1 asst");
+    expect(first.text).toContain("@L3");
 
-    const cursor = textOf(first).match(/— watch cursor: (\S+)/)?.[1] ?? "";
+    const cursor = first.text.match(/— watch cursor: (\S+)/)?.[1] ?? "";
     expect(cursor).not.toBe("");
-    const second = await call(h.client, "kagero_watch", { session_id: "s1", cursor });
-    expect(textOf(second)).toContain("no new events");
+    const second = await handleWatch(watchDeps(h, WATCH_CONFIG), { session_id: "s1", cursor });
+    expect(second.text).toContain("no new events");
   });
 
   it("compresses a large delta, then resumes the SAME compressor session for the next delta", async () => {
@@ -247,25 +295,23 @@ describe("kagero_watch", () => {
       );
     }
 
-    const first = await call(h.client, "kagero_watch", { session_id: "s1" });
-    expect(first.isError).toBeFalsy();
-    const firstText = textOf(first);
-    expect(firstText).toContain("compressed by cheap");
-    expect(firstText).toContain("digest goal: test goal");
-    expect(firstText).toContain("- b1 @L3");
+    const first = await handleWatch(watchDeps(h, WATCH_CONFIG), { session_id: "s1" });
+    expect(first.isError).toBe(false);
+    expect(first.text).toContain("compressed by cheap");
+    expect(first.text).toContain("digest goal: test goal");
+    expect(first.text).toContain("- b1 @L3");
     expect(h.compressor.promptCalls).toHaveLength(1);
     expect(h.compressor.resumeCalls).toHaveLength(0);
     // the first prompt carries the standing instructions (the cache prefix)
     expect(h.compressor.promptCalls[0]).toContain("session-compressor worker");
 
-    const cursor = firstText.match(/— watch cursor: (\S+)/)?.[1] ?? "";
+    const cursor = first.text.match(/— watch cursor: (\S+)/)?.[1] ?? "";
     h.original.entries.push(entry(7, "narration 7 with enough bulk. ".repeat(60)));
 
-    const second = await call(h.client, "kagero_watch", { session_id: "s1", cursor });
-    const secondText = textOf(second);
-    expect(secondText).toContain("compressed by cheap");
-    expect(secondText).toContain("move 1 compressed"); // only the NEW window
-    expect(secondText).toContain("@L21");
+    const second = await handleWatch(watchDeps(h, WATCH_CONFIG), { session_id: "s1", cursor });
+    expect(second.text).toContain("compressed by cheap");
+    expect(second.text).toContain("move 1 compressed"); // only the NEW window
+    expect(second.text).toContain("@L21");
     expect(h.compressor.resumeCalls).toHaveLength(1);
     // the resumed turn must NOT repeat the instructions — the cache keeps them
     expect(h.compressor.resumeCalls[0]).not.toContain("session-compressor worker");
@@ -277,24 +323,23 @@ describe("kagero_watch", () => {
     for (let i = 1; i <= 4; i++) {
       h.original.entries.push(entry(i, `narration ${i} bulk bulk bulk bulk bulk. `.repeat(6)));
     }
-    const result = await call(h.client, "kagero_watch", { session_id: "s1" });
-    expect(result.isError).toBeFalsy();
-    const text = textOf(result);
-    expect(text).toContain("failed validation");
-    expect(text).toContain("reply contained no JSON object");
+    const result = await handleWatch(watchDeps(h, WATCH_CONFIG), { session_id: "s1" });
+    expect(result.isError).toBe(false);
+    expect(result.text).toContain("failed validation");
+    expect(result.text).toContain("reply contained no JSON object");
     // the position still advances — a poll never loses events
-    expect(text).toMatch(/— watch cursor: \S+/);
+    expect(result.text).toMatch(/— watch cursor: \S+/);
   });
 
   it("rejects a cursor from another session", async () => {
     const h = await makeHarness(WATCH_CONFIG);
     h.original.entries.push(entry(1, "tiny"));
-    const result = await call(h.client, "kagero_watch", {
+    const result = await handleWatch(watchDeps(h, WATCH_CONFIG), {
       session_id: "s1",
       cursor: Buffer.from(JSON.stringify({ v: 1, s: "other", i: 3 }), "utf8").toString("base64url"),
     });
     expect(result.isError).toBe(true);
-    expect(textOf(result)).toContain("belongs to a different session");
+    expect(result.text).toContain("belongs to a different session");
   });
 
   it("the reply cites the window's q-id for thinking moves", async () => {
@@ -302,26 +347,22 @@ describe("kagero_watch", () => {
     h.original.entries.push(entry(1, "please fix the race", { role: "user" }));
     const thinking = "stale snapshot on retry — the pivot";
     h.original.entries.push(entry(2, "narration with bulk. ".repeat(60), { thinking }));
-    const result = await call(h.client, "kagero_watch", { session_id: "s1" });
-    const text = textOf(result);
-    expect(text).toContain(`· H (thinking, ${quoteId(thinking)})`);
+    const result = await handleWatch(watchDeps(h, WATCH_CONFIG), { session_id: "s1" });
+    expect(result.text).toContain(`· H (thinking, ${quoteId(thinking)})`);
   });
-});
 
-describe("kagero_watch report header", () => {
   it("renders the report header with rejected/left-open items", async () => {
     const h = await makeHarness(WATCH_CONFIG);
     h.original.entries.push(entry(1, "please fix the race", { role: "user" }));
     const thinking = "approach A re-enters stale — dropped; do B instead";
     h.original.entries.push(entry(2, "narration with bulk. ".repeat(60), { thinking }));
-    const result = await call(h.client, "kagero_watch", { session_id: "s1" });
-    const text = textOf(result);
-    expect(text).toContain("status: working · progress: halfway through · next: continuing");
-    expect(text).toContain(`rejected (${quoteId(thinking)}): an approach that was dropped`);
+    const result = await handleWatch(watchDeps(h, WATCH_CONFIG), { session_id: "s1" });
+    expect(result.text).toContain("status: working · progress: halfway through · next: continuing");
+    expect(result.text).toContain(`rejected (${quoteId(thinking)}): an approach that was dropped`);
   });
 });
 
-describe("prompt/resume session report", () => {
+describe("run session report", () => {
   it("appends the compressed report and facts to a completed run reply", async () => {
     const h = await makeHarness(WATCH_CONFIG);
     // The run's own history: user ask + assistant move with thinking + tools.
@@ -335,7 +376,7 @@ describe("prompt/resume session report", () => {
         toolOk: true,
       }),
     );
-    const result = await call(h.client, "kagero_prompt", { prompt: "fix the race", session_id: "s1" });
+    const result = await call(h.client, "kagero_run", { prompt: "fix the race" });
     expect(result.isError).toBeFalsy();
     const text = textOf(result);
     expect(text.startsWith("fix the race\n\n— session report (compressed by cheap):")).toBe(true);
@@ -349,8 +390,93 @@ describe("prompt/resume session report", () => {
     h.compressor.brokenReply = "no json at all";
     h.original.entries.push(entry(1, "please fix the race", { role: "user" }));
     h.original.entries.push(entry(2, "narration bulk. ".repeat(12)));
-    const result = await call(h.client, "kagero_prompt", { prompt: "fix the race", session_id: "s1" });
+    const result = await call(h.client, "kagero_run", { prompt: "fix the race" });
     expect(result.isError).toBeFalsy();
     expect(textOf(result)).toBe("fix the race");
+  });
+});
+
+describe("history digest header", () => {
+  it("prepends the digest header to kagero_history when journal state exists", async () => {
+    const h = await makeHarness(WATCH_CONFIG);
+    h.original.entries.push(entry(1, "tail entry"));
+    saveWatchState({ v: 1, backend: "orig", sessionId: "s1", cursorIndex: 6, digest: digestOutput(2) });
+    expect(loadWatchState("orig", "s1")?.digest).toBeDefined();
+
+    const result = await call(h.client, "kagero_history", { session_id: "s1" });
+    expect(result.isError).toBeFalsy();
+    const text = textOf(result);
+    expect(text).toContain(
+      "[watch digest] status: working · goal: test goal · belief: test belief · 2 compressed blocks (through entry #6)",
+    );
+    // The paged entries still render below the header.
+    expect(text).toContain("#1 asst");
+  });
+
+  it("history on an older page still carries the header", async () => {
+    const h = await makeHarness(WATCH_CONFIG);
+    saveWatchState({
+      v: 1,
+      backend: "orig",
+      sessionId: "s1",
+      cursorIndex: 0,
+      streamCursorIndex: 11,
+      digest: digestOutput(1),
+    });
+    const result = await call(h.client, "kagero_history", { session_id: "s1", page: 3 });
+    expect(result.isError).toBeFalsy();
+    expect(textOf(result)).toContain("[watch digest]");
+    expect(textOf(result)).toContain("through entry #11");
+  });
+
+  it("no header without journal state", async () => {
+    const h = await makeHarness(WATCH_CONFIG);
+    h.original.entries.push(entry(1, "tail entry"));
+    const result = await call(h.client, "kagero_history", { session_id: "s-none" });
+    expect(result.isError).toBeFalsy();
+    expect(textOf(result)).not.toContain("[watch digest]");
+  });
+});
+
+describe("background run with digest blocks", () => {
+  it("task_output include_blocks prepends the planted digest blocks", async () => {
+    const h = await makeHarness(WATCH_CONFIG);
+    saveWatchState({
+      v: 1,
+      backend: "orig",
+      sessionId: "orig-session",
+      cursorIndex: 6,
+      digest: digestOutput(2),
+    });
+    const started = await call(h.client, "kagero_run", { prompt: "fix the race", run_in_background: true });
+    const taskId = String(jsonOf(started)["task_id"]);
+    const output = await call(h.client, "kagero_task_output", {
+      task_id: taskId,
+      wait_ms: 5_000,
+      include_blocks: true,
+    });
+    expect(output.isError).toBeFalsy();
+    const text = textOf(output);
+    expect(text).toContain("[watch digest blocks]");
+    expect(text).toContain("- b1 @L3");
+    expect(text).toContain("- b2 @L6");
+    expect(text).toContain("finished: succeeded");
+    // The run's compressor report is stored on the task and re-emitted.
+    expect(text).toContain("session report");
+  });
+
+  it("include_blocks without journal state just returns the result", async () => {
+    const h = await makeHarness(WATCH_CONFIG);
+    const started = await call(h.client, "kagero_run", { prompt: "plain", run_in_background: true });
+    const taskId = String(jsonOf(started)["task_id"]);
+    const output = await call(h.client, "kagero_task_output", {
+      task_id: taskId,
+      wait_ms: 5_000,
+      include_blocks: true,
+    });
+    expect(output.isError).toBeFalsy();
+    const text = textOf(output);
+    expect(text).not.toContain("[watch digest blocks]");
+    expect(text).toContain("finished: succeeded");
   });
 });

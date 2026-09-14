@@ -79,6 +79,13 @@ class FakeAgent implements Agent {
     );
   }
 
+  /** Release a held prompt with the default completed response. */
+  release(): void {
+    const release = this.pendingRelease;
+    this.pendingRelease = undefined;
+    release?.(this.defaultResponse());
+  }
+
   emit(event: AgentEvent): void {
     for (const subscriber of [...this.subscribers]) subscriber(event);
   }
@@ -182,6 +189,7 @@ interface Harness {
   clientTransport: InMemoryTransport;
   agent: FakeAgent;
   registry: BackendRegistry;
+  logs: LoggingMessageNotification["params"][];
 }
 
 async function makeHarness(overrides?: Partial<AgentCapabilities>): Promise<Harness> {
@@ -196,8 +204,12 @@ async function makeHarness(overrides?: Partial<AgentCapabilities>): Promise<Harn
   });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "test-client", version: "0.0.0" });
+  const logs: LoggingMessageNotification["params"][] = [];
+  client.setNotificationHandler(LoggingMessageNotificationSchema, (notification) => {
+    logs.push(notification.params);
+  });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-  return { client, clientTransport, agent, registry };
+  return { client, clientTransport, agent, registry, logs };
 }
 
 function asToolResult(result: unknown): CallToolResult {
@@ -221,28 +233,29 @@ function textOf(result: CallToolResult): string {
     .join("\n");
 }
 
+function jsonOf(result: CallToolResult): Record<string, unknown> {
+  return JSON.parse(textOf(result)) as Record<string, unknown>;
+}
+
 describe("kagero MCP server", () => {
-  it("exposes the ten prefixed tools", async () => {
+  it("exposes exactly the seven prefixed tools", async () => {
     const { client } = await makeHarness();
     const { tools } = await client.listTools();
     const names = tools.map((tool) => tool.name).sort();
     expect(names).toEqual([
-      "kagero_abort",
-      "kagero_backends",
       "kagero_history",
-      "kagero_models",
-      "kagero_prompt",
-      "kagero_resume",
-      "kagero_send",
-      "kagero_sessions",
-      "kagero_subscribe",
-      "kagero_unsubscribe",
+      "kagero_info",
+      "kagero_run",
+      "kagero_send_message",
+      "kagero_task_list",
+      "kagero_task_output",
+      "kagero_task_stop",
     ]);
   });
 
-  it("round-trips a prompt: text plus _meta telemetry", async () => {
+  it("round-trips a run: text plus _meta telemetry", async () => {
     const { client, agent } = await makeHarness();
-    const result = await call(client, "kagero_prompt", {
+    const result = await call(client, "kagero_run", {
       prompt: "fix the race",
       backend: "fake",
       model_id: "fake-model",
@@ -265,6 +278,31 @@ describe("kagero MCP server", () => {
     expect(recorded?.opts?.cwd).toBe("/c");
   });
 
+  it("continues a session through run with session_id (resume path)", async () => {
+    const { client, agent } = await makeHarness();
+    const result = await call(client, "kagero_run", {
+      prompt: "keep going",
+      session_id: "sess-1",
+      model_id: "fake-model",
+    });
+    expect(result.isError).toBeFalsy();
+    expect(textOf(result)).toBe("done");
+    expect(agent.resumeCalls).toHaveLength(1);
+    expect(agent.resumeCalls[0]?.sessionId).toBe("sess-1");
+    expect(agent.resumeCalls[0]?.prompt).toBe("keep going");
+    expect(agent.resumeCalls[0]?.opts?.modelId).toBe("fake-model");
+    expect(agent.promptCalls).toHaveLength(0);
+  });
+
+  it("attaches session_id through the prompt path when the backend cannot resume", async () => {
+    const { client, agent } = await makeHarness({ resume: false });
+    const result = await call(client, "kagero_run", { prompt: "attach", session_id: "sess-live" });
+    expect(result.isError).toBeFalsy();
+    expect(agent.resumeCalls).toHaveLength(0);
+    expect(agent.promptCalls).toHaveLength(1);
+    expect(agent.promptCalls[0]?.opts?.sessionId).toBe("sess-live");
+  });
+
   it("refuses honestly when the backend lacks the capability", async () => {
     const noHistory = await makeHarness({ history: false });
     const history = await call(noHistory.client, "kagero_history", { session_id: "sess-1" });
@@ -272,11 +310,14 @@ describe("kagero MCP server", () => {
     expect(textOf(history)).toContain("[unsupported_capability]");
     expect(textOf(history)).toContain("history");
 
-    const noResume = await makeHarness({ resume: false });
-    const resume = await call(noResume.client, "kagero_resume", { session_id: "sess-1", prompt: "continue" });
-    expect(resume.isError).toBe(true);
-    expect(textOf(resume)).toContain("[unsupported_capability]");
-    expect(textOf(resume)).toContain("resume");
+    const noAbort = await makeHarness({ abort: false });
+    const abort = await call(noAbort.client, "kagero_send_message", {
+      session_id: "sess-1",
+      kind: "abort",
+    });
+    expect(abort.isError).toBe(true);
+    expect(textOf(abort)).toContain("[unsupported_capability]");
+    expect(textOf(abort)).toContain("abort");
   });
 
   it("renders session history through the core renderer", async () => {
@@ -310,7 +351,7 @@ describe("kagero MCP server", () => {
       workspaceCreate: false,
       limits: { timeout: false, maxTurns: false, maxToolCalls: false },
     });
-    const result = await call(client, "kagero_prompt", {
+    const result = await call(client, "kagero_run", {
       prompt: "go",
       workspace_create: true,
       timeout_ms: 1000,
@@ -329,7 +370,7 @@ describe("kagero MCP server", () => {
         durationMs: 10,
       }),
     );
-    const result = await call(client, "kagero_prompt", { prompt: "long job" });
+    const result = await call(client, "kagero_run", { prompt: "long job" });
     expect(result.isError).toBe(true);
     const text = textOf(result);
     expect(text).toContain("run timed out");
@@ -338,42 +379,7 @@ describe("kagero MCP server", () => {
     expect(result._meta?.status).toBe("timed-out");
   });
 
-  it("streams subscribe events as logging messages and detaches on unsubscribe", async () => {
-    const { client, agent } = await makeHarness();
-    const logs: LoggingMessageNotification["params"][] = [];
-    client.setNotificationHandler(LoggingMessageNotificationSchema, (notification) => {
-      logs.push(notification.params);
-    });
-
-    const subscribed = await call(client, "kagero_subscribe", { session_id: "sess-live" });
-    expect(subscribed.isError).toBeFalsy();
-    const subId = /subscription_id: (\S+)/.exec(textOf(subscribed))?.[1];
-    expect(subId).toBeDefined();
-
-    agent.emit({ type: "assistant-text", content: "hello there", at: "t0" });
-    await vi.waitFor(() => expect(logs).toHaveLength(1));
-    expect(logs[0]?.level).toBe("info");
-    expect(logs[0]?.logger).toBe("kagero-test");
-    expect(logs[0]?.data).toMatchObject({
-      subscription_id: subId,
-      session_id: "sess-live",
-      event: { type: "assistant-text", content: "hello there" },
-    });
-
-    const unsubscribed = await call(client, "kagero_unsubscribe", { subscription_id: subId });
-    expect(unsubscribed.isError).toBeFalsy();
-    expect(agent.subscribers).toHaveLength(0);
-
-    agent.emit({ type: "assistant-text", content: "after detach", at: "t1" });
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    expect(logs).toHaveLength(1);
-
-    const unknown = await call(client, "kagero_unsubscribe", { subscription_id: "nope" });
-    expect(unknown.isError).toBe(true);
-    expect(textOf(unknown)).toContain("unknown_subscription");
-  });
-
-  it("aborts the in-flight prompt on a wire-level cancelled notification", async () => {
+  it("aborts the in-flight blocking run on a wire-level cancelled notification", async () => {
     const { client, clientTransport, agent } = await makeHarness();
 
     let capturedRequestId: RequestId | undefined;
@@ -386,8 +392,8 @@ describe("kagero MCP server", () => {
     };
 
     agent.hold();
-    const pendingCall = call(client, "kagero_prompt", { prompt: "long job", session_id: "sess-live" });
-    await vi.waitFor(() => expect(agent.promptCalls).toHaveLength(1));
+    const pendingCall = call(client, "kagero_run", { prompt: "long job", session_id: "sess-live" });
+    await vi.waitFor(() => expect(agent.resumeCalls).toHaveLength(1));
 
     const requestId = capturedRequestId;
     expect(requestId).toBeDefined();
@@ -404,14 +410,218 @@ describe("kagero MCP server", () => {
     expect(agent.abortCalls).toEqual(["sess-live"]);
   });
 
-  it("lists backends with the default", async () => {
+  it("info merges backends, default and models of the active backend", async () => {
     const { client, registry } = await makeHarness();
     registry.register("zzz", () => new FakeAgent());
-    const result = await call(client, "kagero_backends");
+    const result = await call(client, "kagero_info");
     expect(result.isError).toBeFalsy();
     const text = textOf(result);
-    expect(text).toContain("fake");
-    expect(text).toContain("zzz");
+    expect(text).toContain("backends: fake, zzz");
     expect(text).toContain("default: fake");
+    expect(text).toContain("models (fake): fake-model");
+  });
+
+  it("info reports 'not reported' when the backend cannot enumerate models", async () => {
+    const { client } = await makeHarness({ models: false });
+    const result = await call(client, "kagero_info", { backend: "fake" });
+    expect(result.isError).toBeFalsy();
+    expect(textOf(result)).toContain("models (fake): not reported");
+  });
+
+  it("send_message steers, queues follow-ups and aborts", async () => {
+    const { client, agent } = await makeHarness();
+
+    const steered = await call(client, "kagero_send_message", {
+      session_id: "sess-live",
+      message: "go left",
+      kind: "steer",
+    });
+    expect(steered.isError).toBeFalsy();
+    expect(textOf(steered)).toContain("steer delivered to sess-live");
+
+    const queued = await call(client, "kagero_send_message", {
+      session_id: "sess-live",
+      message: "and then",
+    });
+    expect(queued.isError).toBeFalsy();
+    expect(agent.sendCalls[1]?.kind).toBe("steer"); // default kind
+
+    const aborted = await call(client, "kagero_send_message", {
+      session_id: "sess-live",
+      kind: "abort",
+    });
+    expect(aborted.isError).toBeFalsy();
+    expect(textOf(aborted)).toContain("abort signal sent to sess-live");
+    expect(agent.abortCalls).toEqual(["sess-live"]);
+    expect(agent.sendCalls).toHaveLength(2);
+  });
+
+  it("send_message requires a message for steer/follow_up", async () => {
+    const { client } = await makeHarness();
+    const missing = await call(client, "kagero_send_message", { session_id: "s1", kind: "follow_up" });
+    expect(missing.isError).toBe(true);
+    expect(textOf(missing)).toContain("message is required");
+  });
+});
+
+describe("kagero background tasks", () => {
+  it("run_in_background returns a task id immediately and task_list shows it running", async () => {
+    const { client, agent } = await makeHarness();
+    agent.hold();
+    const started = await call(client, "kagero_run", {
+      prompt: "long job",
+      run_in_background: true,
+      agent_name: "worker-1",
+      model_id: "fake-model",
+    });
+    expect(started.isError).toBeFalsy();
+    const body = jsonOf(started);
+    expect(body).toEqual({ task_id: "task-1", status: "running" });
+    expect(started._meta).toMatchObject({ taskId: "task-1", status: "running" });
+    // The tool call returned while the run is still parked in the agent.
+    expect(agent.promptCalls).toHaveLength(1);
+
+    const listing = jsonOf(await call(client, "kagero_task_list", {}));
+    expect(listing).toMatchObject({ total: 1, page: 0, page_size: 20 });
+    const task = (listing.tasks as Record<string, unknown>[])[0];
+    expect(task).toMatchObject({
+      task_id: "task-1",
+      status: "running",
+      agent_name: "worker-1",
+      model_id: "fake-model",
+    });
+    expect(task?.elapsed_ms).toBeGreaterThanOrEqual(0);
+  });
+
+  it("completion updates the registry entry and fires the task-completed notification", async () => {
+    const { client, agent, logs } = await makeHarness();
+    agent.hold();
+    const started = await call(client, "kagero_run", { prompt: "job", run_in_background: true });
+    const taskId = jsonOf(started).task_id;
+
+    // While running, task_output reports the status without the result.
+    const running = await call(client, "kagero_task_output", { task_id: taskId as string });
+    expect(running.isError).toBeFalsy();
+    expect(running._meta).toMatchObject({ taskId, status: "running" });
+    expect(textOf(running)).toContain("still running");
+
+    agent.release();
+
+    await vi.waitFor(() =>
+      expect(logs.some((l) => (l.data as Record<string, unknown>)?.["kind"] === "task-completed")).toBe(true),
+    );
+    const note = logs.find((l) => (l.data as Record<string, unknown>)?.["kind"] === "task-completed");
+    expect(note?.data).toMatchObject({
+      kind: "task-completed",
+      task_id: taskId,
+      status: "succeeded",
+      session_id: "sess-1",
+    });
+    expect(String((note?.data as Record<string, unknown>)?.["summary"])).toContain("done");
+
+    const output = await call(client, "kagero_task_output", { task_id: taskId as string });
+    expect(output.isError).toBeFalsy();
+    expect(output._meta).toMatchObject({ taskId, status: "succeeded", sessionId: "sess-1" });
+    expect(output._meta?.usage).toEqual({ inputTokens: 3, outputTokens: 2 });
+    expect(textOf(output)).toContain("task-1 finished: succeeded (session sess-1)");
+    expect(textOf(output)).toContain("done");
+
+    const activeOnly = jsonOf(await call(client, "kagero_task_list", {}));
+    expect(activeOnly.total).toBe(0);
+    const all = jsonOf(await call(client, "kagero_task_list", { active_only: false }));
+    expect(all.total).toBe(1);
+    expect((all.tasks as Record<string, unknown>[])[0]).toMatchObject({
+      task_id: taskId,
+      status: "succeeded",
+    });
+  });
+
+  it("task_output wait_ms waits for a finishing task", async () => {
+    const { client, agent } = await makeHarness();
+    agent.hold();
+    const started = await call(client, "kagero_run", { prompt: "quick job", run_in_background: true });
+    const taskId = jsonOf(started).task_id as string;
+    const pending = call(client, "kagero_task_output", { task_id: taskId, wait_ms: 5_000 });
+    agent.release();
+    const output = await pending;
+    expect(output.isError).toBeFalsy();
+    expect(textOf(output)).toContain("finished: succeeded");
+  });
+
+  it("task_stop aborts the session and marks the task canceled", async () => {
+    const { client, agent, logs } = await makeHarness();
+    agent.hold();
+    const started = await call(client, "kagero_run", {
+      prompt: "job",
+      session_id: "sess-live",
+      run_in_background: true,
+    });
+    const taskId = jsonOf(started).task_id as string;
+
+    const stopped = await call(client, "kagero_task_stop", { task_id: taskId, reason: "no longer needed" });
+    expect(stopped.isError).toBeFalsy();
+    expect(stopped._meta).toMatchObject({ taskId, status: "canceled" });
+    expect(textOf(stopped)).toContain("canceled task-1: no longer needed");
+    expect(agent.abortCalls).toEqual(["sess-live"]);
+
+    const listing = jsonOf(await call(client, "kagero_task_list", { active_only: false }));
+    expect((listing.tasks as Record<string, unknown>[])[0]).toMatchObject({
+      task_id: taskId,
+      status: "canceled",
+    });
+
+    // The abort resolves the held run (status "aborted"); the cancel survives.
+    await vi.waitFor(() =>
+      expect(logs.some((l) => (l.data as Record<string, unknown>)?.["kind"] === "task-completed")).toBe(true),
+    );
+    const note = logs.find((l) => (l.data as Record<string, unknown>)?.["kind"] === "task-completed");
+    expect(note?.data).toMatchObject({ task_id: taskId, status: "canceled" });
+    const all = jsonOf(await call(client, "kagero_task_list", { active_only: false }));
+    expect((all.tasks as Record<string, unknown>[])[0]).toMatchObject({ status: "canceled" });
+  });
+
+  it("task_stop on a finished task and unknown task ids are honest errors", async () => {
+    const { client } = await makeHarness();
+    const unknownOutput = await call(client, "kagero_task_output", { task_id: "task-99" });
+    expect(unknownOutput.isError).toBe(true);
+    expect(textOf(unknownOutput)).toContain("[unknown_task]");
+
+    const unknownStop = await call(client, "kagero_task_stop", { task_id: "task-99" });
+    expect(unknownStop.isError).toBe(true);
+    expect(textOf(unknownStop)).toContain("[unknown_task]");
+
+    // A run that already finished cannot be stopped.
+    await call(client, "kagero_run", { prompt: "fast", run_in_background: true });
+    const finishedStop = await call(client, "kagero_task_stop", { task_id: "task-1" });
+    expect(finishedStop.isError).toBe(true);
+    expect(textOf(finishedStop)).toContain("[task_not_running]");
+  });
+
+  it("a failed background run lands as failed with the error text", async () => {
+    const { client, agent } = await makeHarness();
+    agent.onPrompt(() => Promise.reject(new Error("backend exploded")));
+    const started = await call(client, "kagero_run", { prompt: "doomed", run_in_background: true });
+    const taskId = jsonOf(started).task_id as string;
+    const output = await call(client, "kagero_task_output", { task_id: taskId, wait_ms: 1_000 });
+    expect(output.isError).toBeFalsy();
+    expect(output._meta).toMatchObject({ taskId, status: "failed" });
+    expect(textOf(output)).toContain("task-1 finished: failed");
+    expect(textOf(output)).toContain("backend exploded");
+  });
+
+  it("task_list pages the registry", async () => {
+    const { client, agent } = await makeHarness();
+    for (const prompt of ["one", "two", "three"]) {
+      await call(client, "kagero_run", { prompt, run_in_background: true });
+    }
+    agent.release();
+    const page0 = jsonOf(await call(client, "kagero_task_list", { active_only: false, page_size: 2 }));
+    expect(page0.total).toBe(3);
+    expect(page0.page).toBe(0);
+    expect((page0.tasks as unknown[]).length).toBe(2);
+    const page1 = jsonOf(
+      await call(client, "kagero_task_list", { active_only: false, page: 1, page_size: 2 }),
+    );
+    expect((page1.tasks as unknown[]).length).toBe(1);
   });
 });

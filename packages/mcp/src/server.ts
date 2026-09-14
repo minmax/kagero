@@ -1,37 +1,43 @@
 /**
  * server.ts — the MCP facade over the Agent contract.
  *
- * One factory, ten honest tools. Design rules:
+ * One factory, seven honest tools. Design rules:
  *  - The server advertises `{ tools: {}, logging: {} }`: without the logging
- *    capability `sendLoggingMessage` is a silent no-op and subscribe would
+ *    capability `sendLoggingMessage` is a silent no-op and the live feed would
  *    swallow every agent event (the P0 from the v0.1 audit).
  *  - Every tool checks the agent's capabilities BEFORE calling it and refuses
  *    with an `[unsupported_capability]` isError result — never an exception,
  *    never a pretend success.
- *  - `prompt`/`resume` never throw on abort or timeout: the run comes back as
- *    an isError result whose text names the still-resumable session, and
- *    `_meta` carries status / sessionId / model / workspace / usage.
+ *  - `run` never throws on abort or timeout: the run comes back as an isError
+ *    result whose text names the still-resumable session, and `_meta` carries
+ *    status / sessionId / model / workspace / usage. With
+ *    `run_in_background: true` the call returns a task id immediately; the
+ *    registry (`tasks`) tracks the run and a `task-completed` logging
+ *    notification announces the outcome. `task_list` / `task_output` /
+ *    `task_stop` read and steer that registry.
  *  - `notifications/cancelled` is honored at the wire level: the matching
- *    in-flight prompt/resume is aborted through `agent.abort(sessionId)` when
+ *    in-flight blocking `run` is aborted through `agent.abort(sessionId)` when
  *    the session is known. The factory takes over the SDK's default handling
  *    of that notification (which only aborted the handler's AbortSignal) —
  *    the Agent contract has no signal input, so the cancel must be routed to
  *    `agent.abort` explicitly.
- *  - `stop()` detaches every live subscription and disposes the registry.
+ *  - `stop()` disposes the registry; the task registry is server-lifetime
+ *    memory (v1) and dies with the process.
  */
 
-import { randomUUID } from "node:crypto";
 import {
   type Agent,
   type AgentCapabilities,
   AgentError,
-  type AgentEvent,
   type AgentResponse,
   type BackendRegistry,
   DEFAULT_HISTORY_PAGE_SIZE,
+  type DigestWindow,
   MAX_HISTORY_PAGE_SIZE,
   type PromptOptions,
+  renderDigestBlocks,
   renderHistory,
+  type UsageTelemetry,
   unsupportedCapability,
   type WorkspaceOption,
 } from "@kagero/core";
@@ -48,22 +54,15 @@ import type {
 import { CancelledNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { StreamCompressorHub } from "./stream-compressor.js";
-import {
-  handleWatch,
-  readWatchConfig,
-  summarizeRun,
-  WATCH_TOOL_DESCRIPTION,
-  type WatchArgs,
-  type WatchConfig,
-  watchInputSchema,
-} from "./watch.js";
+import { readWatchConfig, summarizeRun, type WatchConfig } from "./watch.js";
+import { loadWatchState } from "./watch-state.js";
 
 /** Options for {@link createKageroMcpServer}. */
 export interface KageroMcpServerOptions {
   /** Server name reported to MCP clients, e.g. "kagero" or "claude-mcp". */
   readonly name: string;
   readonly version: string;
-  /** Tool name prefix. Default "kagero" → tools "kagero_prompt", … */
+  /** Tool name prefix. Default "kagero" → tools "kagero_run", … */
   readonly toolPrefix?: string;
   /** Backend registry — owned by the caller, disposed on stop(). */
   readonly registry: BackendRegistry;
@@ -77,7 +76,8 @@ export interface KageroMcpServerOptions {
   /**
    * Watch/compressor configuration; default comes from the environment
    * (KAGERO_COMPRESS_BACKEND / KAGERO_COMPRESS_MODEL). When unset on both
-   * paths the `${prefix}_watch` tool is not registered at all.
+   * paths there is no compressor: no live feed, no run reports, no digest
+   * headers — the run tools work exactly the same otherwise.
    */
   readonly watch?: WatchConfig | undefined;
 }
@@ -101,34 +101,71 @@ function runOptionFields() {
   };
 }
 
-const PromptInput = z
+const RunInput = z
   .object({
     prompt: z.string().min(1),
-    backend: z.string().optional(),
     session_id: z.string().optional(),
+    backend: z.string().optional(),
     agent_name: agentNameSchema(),
     workspace_create: z.boolean().optional(),
     workspace_path: z.string().optional(),
+    run_in_background: z.boolean().default(false),
     ...runOptionFields(),
   })
   .strict();
-type PromptInput = z.infer<typeof PromptInput>;
+type RunInput = z.infer<typeof RunInput>;
 
-const ResumeInput = z
+const SendMessageInput = z
   .object({
     session_id: z.string(),
-    prompt: z.string().min(1),
+    message: z.string().min(1).optional(),
+    kind: z.enum(["steer", "follow_up", "abort"]).default("steer"),
     backend: z.string().optional(),
-    agent_name: agentNameSchema(),
-    ...runOptionFields(),
   })
   .strict();
-type ResumeInput = z.infer<typeof ResumeInput>;
+type SendMessageInput = z.infer<typeof SendMessageInput>;
 
-const ModelsInput = z.object({ backend: z.string().optional() }).strict();
-type ModelsInput = z.infer<typeof ModelsInput>;
+const TaskListInput = z
+  .object({
+    active_only: z.boolean().default(true),
+    page: z.number().int().min(0).default(0),
+    page_size: z.number().int().min(1).max(200).default(20),
+  })
+  .strict();
+type TaskListInput = z.infer<typeof TaskListInput>;
 
-/** Optional display name for the server's session registry: 1..64, no control chars. */
+const TaskOutputInput = z
+  .object({
+    task_id: z.string(),
+    wait_ms: z.number().int().min(0).default(0),
+    include_blocks: z.boolean().default(false),
+  })
+  .strict();
+type TaskOutputInput = z.infer<typeof TaskOutputInput>;
+
+const TaskStopInput = z
+  .object({
+    task_id: z.string(),
+    reason: z.string().optional(),
+  })
+  .strict();
+type TaskStopInput = z.infer<typeof TaskStopInput>;
+
+const HistoryInput = z
+  .object({
+    session_id: z.string(),
+    page: z.number().int().min(0).optional(),
+    page_size: z.number().int().min(1).max(MAX_HISTORY_PAGE_SIZE).optional(),
+    max_chars: z.number().int().positive().optional(),
+    backend: z.string().optional(),
+  })
+  .strict();
+type HistoryInput = z.infer<typeof HistoryInput>;
+
+const InfoInput = z.object({ backend: z.string().optional() }).strict();
+type InfoInput = z.infer<typeof InfoInput>;
+
+/** Optional display name for a background task's session: 1..64, no control chars. */
 function agentNameSchema() {
   const hasControlChar = (value: string): boolean => {
     for (const ch of value) {
@@ -146,42 +183,35 @@ function agentNameSchema() {
     .optional();
 }
 
-const SessionsInput = z.object({ backend: z.string().optional() }).strict();
-type SessionsInput = z.infer<typeof SessionsInput>;
+/** Lifecycle of a background task. */
+type TaskStatus = "running" | "succeeded" | "failed" | "canceled";
 
-const HistoryInput = z
-  .object({
-    session_id: z.string(),
-    page: z.number().int().min(0).optional(),
-    page_size: z.number().int().min(1).max(MAX_HISTORY_PAGE_SIZE).optional(),
-    max_chars: z.number().int().positive().optional(),
-    backend: z.string().optional(),
-  })
-  .strict();
-type HistoryInput = z.infer<typeof HistoryInput>;
+/** The final outcome stored in a finished task's registry entry. */
+interface TaskResult {
+  readonly status: TaskStatus;
+  readonly text: string;
+  /** The compressed session report appended to the run text, when produced. */
+  readonly report?: string;
+  readonly usage?: UsageTelemetry;
+  readonly error?: string;
+}
 
-const SendInput = z
-  .object({
-    session_id: z.string(),
-    message: z.string().min(1),
-    kind: z.enum(["steer", "follow_up"]),
-    backend: z.string().optional(),
-  })
-  .strict();
-type SendInput = z.infer<typeof SendInput>;
+/** One background run in the server-lifetime registry. */
+interface TaskEntry {
+  readonly taskId: string;
+  readonly backend: string;
+  status: TaskStatus;
+  sessionId?: string;
+  agentName?: string;
+  modelId?: string;
+  /** timeout_ms is a label in background mode — it never aborts the run. */
+  readonly timeoutLabelMs?: number;
+  readonly startedAt: number;
+  finishedAt?: number;
+  result?: TaskResult;
+}
 
-const SubscribeInput = z.object({ session_id: z.string(), backend: z.string().optional() }).strict();
-type SubscribeInput = z.infer<typeof SubscribeInput>;
-
-const UnsubscribeInput = z.object({ subscription_id: z.string() }).strict();
-type UnsubscribeInput = z.infer<typeof UnsubscribeInput>;
-
-const AbortInput = z.object({ session_id: z.string(), backend: z.string().optional() }).strict();
-type AbortInput = z.infer<typeof AbortInput>;
-
-const BackendsInput = z.object({}).strict();
-
-/** Optional prompt/resume limits the caller asked for, for capability gating. */
+/** Optional prompt limits the caller asked for, for capability gating. */
 interface RequestedLimits {
   timeout_ms?: number | undefined;
   max_turns?: number | undefined;
@@ -189,7 +219,7 @@ interface RequestedLimits {
   workspace_create?: boolean | undefined;
 }
 
-/** Structural view of the run-option fields shared by prompt and resume inputs. */
+/** Structural view of the run-option fields of the `run` tool input. */
 interface RunArgsLike {
   cwd?: string | undefined;
   model_id?: string | undefined;
@@ -228,14 +258,7 @@ interface HistoryOptionsDraft {
   maxChars?: number;
 }
 
-/** A live subscribe → logging bridge, releasable by unsubscribe or stop(). */
-interface LiveSubscription {
-  readonly unsubscribe: () => void;
-  readonly backend: string;
-  readonly sessionId: string;
-}
-
-/** One in-flight prompt/resume, cancellable from the wire. */
+/** One in-flight blocking call, cancellable from the wire. */
 interface InflightCall {
   readonly controller: AbortController;
   agent: Agent | undefined;
@@ -246,10 +269,10 @@ interface InflightCall {
 function defaultInstructions(prefix: string, backends: string[], defaultBackend: string): string {
   return [
     `Kagero runs coding-agent backends and exposes them as MCP tools (prefix "${prefix}_").`,
-    `Start a run with ${prefix}_prompt; continue with ${prefix}_resume. Sessions survive timeouts and aborts: the error text names the resumable session id.`,
-    `Inspect state with ${prefix}_models, ${prefix}_sessions, ${prefix}_history; steer live runs with ${prefix}_send; stop a run with ${prefix}_abort.`,
-    `Live events: ${prefix}_subscribe forwards agent events as logging messages (level info); detach with ${prefix}_unsubscribe.`,
-    `A client may cancel an in-flight ${prefix}_prompt/${prefix}_resume with notifications/cancelled; the run is then aborted and reported as aborted, not lost.`,
+    `Start a run with ${prefix}_run; pass session_id to continue an existing session. Sessions survive timeouts and aborts: the error text names the resumable session id.`,
+    `Set run_in_background: true to not block: the reply carries a task_id — poll ${prefix}_task_list / ${prefix}_task_output, stop with ${prefix}_task_stop.`,
+    `Inspect state with ${prefix}_info and ${prefix}_history; steer a live run with ${prefix}_send_message (kind "steer", "follow_up" or "abort").`,
+    `A client may cancel an in-flight blocking ${prefix}_run with notifications/cancelled; the run is then aborted and reported as aborted, not lost.`,
     `Every tool reports what its backend cannot do as an "[unsupported_capability]" error instead of pretending.`,
     `Registered backends: ${backends.length > 0 ? backends.join(", ") : "(none)"}. Default backend: ${defaultBackend}.`,
   ].join("\n");
@@ -285,9 +308,9 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
               .catch(() => undefined);
           },
         });
-  const subscriptions = new Map<string, LiveSubscription>();
-  /** agent_name per `<backend>:<sessionId>`; server-lifetime only (no state file). */
-  const sessionNames = new Map<string, string>();
+  /** Server-lifetime registry of background runs (v1: in-memory only). */
+  const tasks = new Map<string, TaskEntry>();
+  let nextTaskNumber = 1;
   const inflight = new Map<RequestId, InflightCall>();
 
   const instructions =
@@ -297,8 +320,9 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
       if (watchConfig === undefined) return base;
       return (
         base +
-        `\nBackground sessions: ${prefix}_watch returns a compressed delta of a running session (agenttrace-style ` +
-        `blocks with @L anchors); poll it with the returned cursor. Compressor backend: "${watchConfig.backend}".`
+        `\nBackground sessions: run-stream events are compressed by a cheap agent (backend "${watchConfig.backend}") ` +
+        `into anchored digests; ${prefix}_history prepends the digest header when one exists and ` +
+        `${prefix}_task_output (include_blocks: true) returns the compressed blocks.`
       );
     })();
 
@@ -366,7 +390,9 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
           ? (error.context["sessionId"] as string)
           : undefined;
       const resumeHint =
-        resumeId === undefined ? "" : `\n[resumable session: ${resumeId}] — pass it as session_id to ${prefix}_resume.`;
+        resumeId === undefined
+          ? ""
+          : `\n[resumable session: ${resumeId}] — pass it as session_id to ${prefix}_run.`;
       return errorResult(`[${error.code}] ${error.message}${resumeHint}`);
     }
     const message = error instanceof Error ? error.message : String(error);
@@ -420,11 +446,15 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
     }
   }
 
-  function buildRunOptions(args: RunArgsLike, includeSessionId: boolean): PromptOptions {
+  function buildRunOptions(
+    args: RunArgsLike,
+    includeSessionId: boolean,
+    includeTimeout = true,
+  ): PromptOptions {
     const draft: RunOptionsDraft = {};
     if (args.cwd !== undefined) draft.cwd = args.cwd;
     if (args.model_id !== undefined) draft.modelId = args.model_id;
-    if (args.timeout_ms !== undefined) draft.timeoutMs = args.timeout_ms;
+    if (includeTimeout && args.timeout_ms !== undefined) draft.timeoutMs = args.timeout_ms;
     if (args.max_turns !== undefined) draft.maxTurns = args.max_turns;
     if (args.max_tool_calls !== undefined) draft.maxToolCalls = args.max_tool_calls;
     if (args.approval_mode !== undefined) draft.approvalMode = args.approval_mode;
@@ -443,23 +473,130 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
   }
 
   /**
-   * The run reply, with the session report appended when the compressor is
-   * configured. summarizeRun never throws and returns undefined on any
-   * failure — the run's own answer stays intact either way.
+   * The compressed session report for a finished run, or undefined on any
+   * failure. summarizeRun never throws — the run's own answer stays intact.
    */
-  async function responseResultWithReport(backend: string, response: AgentResponse): Promise<CallToolResult> {
-    if (watchConfig === undefined || response.sessionId === undefined) return responseResult(response);
-    const report = await summarizeRun(
+  function runReport(backend: string, response: AgentResponse): Promise<string | undefined> {
+    if (watchConfig === undefined || response.sessionId === undefined) return Promise.resolve(undefined);
+    return summarizeRun(
       { selectAgent, defaultBackend: opts.defaultBackend, config: watchConfig },
       backend,
       response,
     );
+  }
+
+  /** The run reply, with the session report appended when the compressor produced one. */
+  async function responseResultWithReport(backend: string, response: AgentResponse): Promise<CallToolResult> {
+    const report = await runReport(backend, response);
     if (report === undefined) return responseResult(response);
     const base = responseResult(response);
     return { ...base, content: [{ type: "text", text: `${response.text}\n\n${report}` }] };
   }
 
-  async function handlePrompt(args: PromptInput, extra: ToolExtra): Promise<CallToolResult> {
+  // --- background task registry ---------------------------------------------
+
+  function elapsedMs(task: TaskEntry): number {
+    return Math.max(0, (task.finishedAt ?? Date.now()) - task.startedAt);
+  }
+
+  function taskSummary(result: TaskResult): string {
+    const full = result.report === undefined ? result.text : `${result.text}\n\n${result.report}`;
+    return full.length > 200 ? `${full.slice(0, 200)}…` : full;
+  }
+
+  /** Store the outcome and announce it as a logging notification. */
+  function finishTask(task: TaskEntry, result: TaskResult): void {
+    task.finishedAt = Date.now();
+    task.result = result;
+    // A task_stop cancel must survive a racing run outcome (the run resolves
+    // aborted after the abort, or completes before it lands): the caller asked
+    // for the cancellation, it stays the honest final status.
+    if (task.status !== "canceled") task.status = result.status;
+    void server
+      .sendLoggingMessage({
+        level: "info",
+        logger: opts.name,
+        data: {
+          kind: "task-completed",
+          task_id: task.taskId,
+          status: task.status,
+          session_id: task.sessionId,
+          summary: taskSummary(result),
+        },
+      })
+      .catch(() => undefined);
+  }
+
+  function runStatusToTaskStatus(status: AgentResponse["status"]): TaskStatus {
+    if (status === "completed") return "succeeded";
+    if (status === "aborted") return "canceled";
+    return "failed";
+  }
+
+  /** Kick off a background run WITHOUT awaiting it; completion updates the registry. */
+  function startBackgroundRun(task: TaskEntry, agent: Agent, args: RunInput): void {
+    const sessionId = args.session_id;
+    const viaResume = sessionId !== undefined && agent.capabilities.resume;
+    const options = buildRunOptions(args, !viaResume, false);
+    const pending = viaResume
+      ? agent.resume(sessionId, args.prompt, options)
+      : agent.prompt(args.prompt, options);
+    void pending.then(
+      async (response) => {
+        if (response.sessionId !== undefined) task.sessionId = response.sessionId;
+        if (response.modelId !== undefined) task.modelId = response.modelId;
+        const report = await runReport(agent.name, response);
+        finishTask(task, {
+          status: runStatusToTaskStatus(response.status),
+          text: response.text,
+          ...(report !== undefined ? { report } : {}),
+          ...(response.usage !== undefined ? { usage: response.usage } : {}),
+        });
+      },
+      (error: unknown) => {
+        finishTask(task, {
+          status: "failed",
+          text: "",
+          error: error instanceof AgentError ? `[${error.code}] ${error.message}` : String(error),
+        });
+      },
+    );
+  }
+
+  /**
+   * The compressed-blocks section of a session's watch journal digest, when
+   * one exists (the stream compressor checkpointed batches for this session).
+   */
+  function digestBlocksSection(backend: string, sessionId: string): string | undefined {
+    const state = loadWatchState(backend, sessionId);
+    if (state?.digest === undefined) return undefined;
+    const aggregate: DigestWindow = {
+      turns: [],
+      text: "",
+      entryFrom: 0,
+      entryTo: state.streamCursorIndex ?? state.cursorIndex,
+      tokens: 0,
+      quoteIds: new Set<string>(),
+      thinkingTurnIndexes: new Set<number>(),
+    };
+    return renderDigestBlocks(state.digest, aggregate);
+  }
+
+  /** One-line digest header for the history view: status / goal / belief / volume. */
+  function digestHistoryHeader(backend: string, sessionId: string): string | undefined {
+    const state = loadWatchState(backend, sessionId);
+    const output = state?.digest;
+    if (output === undefined) return undefined;
+    const upto = state?.streamCursorIndex ?? state?.cursorIndex ?? 0;
+    return (
+      `[watch digest] status: ${output.report?.status ?? "working"} · goal: ${output.digest.goal} · ` +
+      `belief: ${output.digest.currentBelief} · ${output.blocks.length} compressed blocks (through entry #${upto})`
+    );
+  }
+
+  // --- tool handlers ----------------------------------------------------------
+
+  async function handleRun(args: RunInput, extra: ToolExtra): Promise<CallToolResult> {
     const entry = beginCall(extra.requestId);
     try {
       const agent = await selectAgent(args.backend);
@@ -471,10 +608,33 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
         // The cancel raced ahead of backend selection — still land it.
         void agent.abort(args.session_id).catch(() => undefined);
       }
-      const response = await agent.prompt(args.prompt, buildRunOptions(args, true));
-      if (args.agent_name !== undefined && response.sessionId !== undefined) {
-        sessionNames.set(`${agent.name}:${response.sessionId}`, args.agent_name);
+
+      if (args.run_in_background) {
+        const taskId = `task-${nextTaskNumber}`;
+        nextTaskNumber += 1;
+        const task: TaskEntry = {
+          taskId,
+          backend: agent.name,
+          status: "running",
+          startedAt: Date.now(),
+          ...(args.session_id !== undefined ? { sessionId: args.session_id } : {}),
+          ...(args.agent_name !== undefined ? { agentName: args.agent_name } : {}),
+          ...(args.model_id !== undefined ? { modelId: args.model_id } : {}),
+          ...(args.timeout_ms !== undefined ? { timeoutLabelMs: args.timeout_ms } : {}),
+        };
+        tasks.set(taskId, task);
+        startBackgroundRun(task, agent, args);
+        return okResult(JSON.stringify({ task_id: taskId, status: "running" }), {
+          taskId,
+          status: "running",
+        });
       }
+
+      const continuing = args.session_id !== undefined;
+      const response =
+        continuing && agent.capabilities.resume
+          ? await agent.resume(args.session_id as string, args.prompt, buildRunOptions(args, false))
+          : await agent.prompt(args.prompt, buildRunOptions(args, true));
       return await responseResultWithReport(agent.name, response);
     } catch (error) {
       return toErrorResult(error);
@@ -483,55 +643,124 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
     }
   }
 
-  async function handleResume(args: ResumeInput, extra: ToolExtra): Promise<CallToolResult> {
-    const entry = beginCall(extra.requestId);
+  async function handleSendMessage(args: SendMessageInput): Promise<CallToolResult> {
+    const agent = await selectAgent(args.backend);
+    if (args.kind === "abort") {
+      if (!agent.capabilities.abort) {
+        throw unsupportedCapability("abort", "Pick a backend whose runs can be stopped.");
+      }
+      await agent.abort(args.session_id);
+      return okResult(`abort signal sent to ${args.session_id}.`);
+    }
+    if (args.message === undefined) {
+      return errorResult(`[invalid_arguments] message is required when kind is "${args.kind}".`);
+    }
+    if (args.kind === "steer" && !agent.capabilities.steer) {
+      throw unsupportedCapability(
+        "steer",
+        'Pick a backend that accepts mid-run redirects, or use send_message kind "abort".',
+      );
+    }
+    if (args.kind === "follow_up" && !agent.capabilities.followUp) {
+      throw unsupportedCapability(
+        "follow_up",
+        `Pick a backend that queues post-turn messages, or run again with session_id via ${prefix}_run.`,
+      );
+    }
+    await agent.send(args.session_id, args.message, args.kind);
+    return okResult(`${args.kind} delivered to ${args.session_id}.`);
+  }
+
+  function handleTaskList(args: TaskListInput): CallToolResult {
+    const all = [...tasks.values()].reverse(); // newest first
+    const filtered = args.active_only ? all.filter((task) => task.status === "running") : all;
+    const start = args.page * args.page_size;
+    const page = filtered.slice(start, start + args.page_size).map((task) => ({
+      task_id: task.taskId,
+      ...(task.sessionId !== undefined ? { session_id: task.sessionId } : {}),
+      status: task.status,
+      ...(task.agentName !== undefined ? { agent_name: task.agentName } : {}),
+      ...(task.modelId !== undefined ? { model_id: task.modelId } : {}),
+      elapsed_ms: elapsedMs(task),
+    }));
+    return okResult(
+      JSON.stringify(
+        { tasks: page, total: filtered.length, page: args.page, page_size: args.page_size },
+        null,
+        2,
+      ),
+    );
+  }
+
+  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+  async function handleTaskOutput(args: TaskOutputInput, extra: ToolExtra): Promise<CallToolResult> {
+    const task = tasks.get(args.task_id);
+    if (task === undefined) {
+      return errorResult(`[unknown_task] No such task: ${args.task_id}`);
+    }
+    const call = beginCall(extra.requestId);
     try {
-      const agent = await selectAgent(args.backend);
-      entry.agent = agent;
-      entry.sessionId = args.session_id;
-      streamHub?.attach(agent);
-      if (!agent.capabilities.resume) {
-        throw unsupportedCapability(
-          "resume",
-          "Pick a backend with persistent sessions; one-shot prompt still works.",
-        );
+      const deadline = Date.now() + args.wait_ms;
+      while (task.status === "running" && Date.now() < deadline && !call.cancelDelivered) {
+        await sleep(25);
       }
-      checkLimitCapabilities(agent.capabilities, args);
-      if (entry.cancelDelivered) {
-        void agent.abort(args.session_id).catch(() => undefined);
-      }
-      const response = await agent.resume(args.session_id, args.prompt, buildRunOptions(args, false));
-      if (args.agent_name !== undefined) {
-        sessionNames.set(`${agent.name}:${response.sessionId ?? args.session_id}`, args.agent_name);
-      }
-      return await responseResultWithReport(agent.name, response);
-    } catch (error) {
-      return toErrorResult(error);
     } finally {
       endCall(extra.requestId);
     }
+
+    const meta: Record<string, unknown> = { taskId: task.taskId, status: task.status };
+    if (task.sessionId !== undefined) meta.sessionId = task.sessionId;
+    if (task.modelId !== undefined) meta.modelId = task.modelId;
+    if (task.result?.usage !== undefined) meta.usage = task.result.usage;
+
+    if (task.status === "running") {
+      return okResult(`${task.taskId} is still running (${Math.round(elapsedMs(task) / 100) / 10}s).`, meta);
+    }
+
+    const result = task.result;
+    const lines: string[] = [
+      `${task.taskId} finished: ${task.status}` +
+        (task.sessionId !== undefined ? ` (session ${task.sessionId})` : ""),
+    ];
+    if (result?.error !== undefined) lines.push(`error: ${result.error}`);
+    if (result !== undefined && result.text !== "") lines.push(result.text);
+    if (result?.report !== undefined) lines.push(result.report);
+    if (args.include_blocks && task.sessionId !== undefined) {
+      const blocks = digestBlocksSection(task.backend, task.sessionId);
+      if (blocks !== undefined) lines.unshift(`[watch digest blocks]\n${blocks}`);
+    }
+    return okResult(lines.join("\n"), meta);
   }
 
-  async function handleModels(args: ModelsInput): Promise<CallToolResult> {
-    const agent = await selectAgent(args.backend);
-    if (!agent.capabilities.models) {
-      throw unsupportedCapability("models", "Pick a backend that can enumerate its models.");
+  async function handleTaskStop(args: TaskStopInput): Promise<CallToolResult> {
+    const task = tasks.get(args.task_id);
+    if (task === undefined) {
+      return errorResult(`[unknown_task] No such task: ${args.task_id}`);
     }
-    const models = await agent.listModels();
-    return okResult(models.length === 0 ? "Backend reports no models." : JSON.stringify(models, null, 2));
-  }
-
-  async function handleSessions(args: SessionsInput): Promise<CallToolResult> {
-    const agent = await selectAgent(args.backend);
-    if (!agent.capabilities.sessions) {
-      throw unsupportedCapability("sessions", "Pick a backend that tracks persistent sessions.");
+    if (task.status !== "running") {
+      return errorResult(`[task_not_running] ${task.taskId} already finished: ${task.status}.`);
     }
-    const sessions = await agent.listSessions();
-    const named = sessions.map((session) => {
-      const name = sessionNames.get(`${agent.name}:${session.id}`);
-      return name === undefined ? session : { ...session, name };
+    if (task.sessionId !== undefined) {
+      const agent = await selectAgent(task.backend);
+      if (!agent.capabilities.abort) {
+        throw unsupportedCapability("abort", "Pick a backend whose runs can be stopped.");
+      }
+      await agent.abort(task.sessionId);
+    }
+    task.finishedAt = Date.now();
+    task.status = "canceled";
+    task.result = {
+      status: "canceled",
+      text: task.result?.text ?? "",
+      ...(task.result?.report !== undefined ? { report: task.result.report } : {}),
+      ...(task.result?.usage !== undefined ? { usage: task.result.usage } : {}),
+      ...(args.reason !== undefined ? { error: `canceled: ${args.reason}` } : { error: "canceled" }),
+    };
+    return okResult(`canceled ${task.taskId}${args.reason === undefined ? "." : `: ${args.reason}`}`, {
+      taskId: task.taskId,
+      status: "canceled",
     });
-    return okResult(named.length === 0 ? "Backend reports no sessions." : JSON.stringify(named, null, 2));
   }
 
   async function handleHistory(args: HistoryInput): Promise<CallToolResult> {
@@ -539,7 +768,7 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
     if (!agent.capabilities.history) {
       throw unsupportedCapability(
         "history",
-        "Pick a backend that records conversation history (see kagero_backends).",
+        `Pick a backend that records conversation history (see ${prefix}_info).`,
       );
     }
     const options: HistoryOptionsDraft = {};
@@ -547,126 +776,94 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
     if (args.page_size !== undefined) options.pageSize = args.page_size;
     if (args.max_chars !== undefined) options.maxChars = args.max_chars;
     const result = await agent.history(args.session_id, options);
-    return okResult(renderHistory(result));
+    const rendered = renderHistory(result);
+    const header = digestHistoryHeader(agent.name, args.session_id);
+    return okResult(header === undefined ? rendered : `${header}\n${rendered}`);
   }
 
-  async function handleSend(args: SendInput): Promise<CallToolResult> {
-    const agent = await selectAgent(args.backend);
-    if (args.kind === "steer" && !agent.capabilities.steer) {
-      throw unsupportedCapability(
-        "steer",
-        "Pick a backend that accepts mid-run redirects, or use kagero_abort.",
-      );
-    }
-    if (args.kind === "follow_up" && !agent.capabilities.followUp) {
-      throw unsupportedCapability(
-        "follow_up",
-        "Pick a backend that queues post-turn messages, or use kagero_prompt.",
-      );
-    }
-    await agent.send(args.session_id, args.message, args.kind);
-    return okResult(`${args.kind} delivered to ${args.session_id}.`);
-  }
-
-  async function handleSubscribe(args: SubscribeInput): Promise<CallToolResult> {
-    const agent = await selectAgent(args.backend);
-    if (!agent.capabilities.subscribe) {
-      throw unsupportedCapability("subscribe", "Pick a backend that emits live events.");
-    }
-    const backend = args.backend ?? opts.defaultBackend;
-    const sessionId = args.session_id;
-    const subId = randomUUID();
-    const unsubscribe = agent.subscribe(sessionId, (event: AgentEvent) => {
-      void server
-        .sendLoggingMessage({
-          level: "info",
-          logger: opts.name,
-          data: { subscription_id: subId, backend, session_id: sessionId, event },
-        })
-        .catch(() => undefined);
-    });
-    subscriptions.set(subId, { unsubscribe, backend, sessionId });
-    return okResult(
-      [
-        `subscribed to ${sessionId} on backend "${backend}"`,
-        `subscription_id: ${subId}`,
-        `events arrive as logging messages (logger "${opts.name}"); detach with ${prefix}_unsubscribe.`,
-      ].join("\n"),
-    );
-  }
-
-  async function handleUnsubscribe(args: UnsubscribeInput): Promise<CallToolResult> {
-    const sub = subscriptions.get(args.subscription_id);
-    if (sub === undefined) {
-      return errorResult(`[unknown_subscription] No live subscription: ${args.subscription_id}`);
-    }
-    subscriptions.delete(args.subscription_id);
-    sub.unsubscribe();
-    return okResult(`unsubscribed ${args.subscription_id}.`);
-  }
-
-  async function handleAbort(args: AbortInput): Promise<CallToolResult> {
-    const agent = await selectAgent(args.backend);
-    if (!agent.capabilities.abort) {
-      throw unsupportedCapability("abort", "Pick a backend whose runs can be stopped.");
-    }
-    await agent.abort(args.session_id);
-    return okResult(`abort signal sent to ${args.session_id}.`);
-  }
-
-  function handleBackends(): CallToolResult {
+  async function handleInfo(args: InfoInput): Promise<CallToolResult> {
     const names = [...opts.registry.names()].sort();
+    const backend = args.backend ?? opts.defaultBackend;
+    let modelsText: string;
+    try {
+      const agent = await selectAgent(backend);
+      const models = agent.capabilities.models ? await agent.listModels() : [];
+      modelsText = models.length === 0 ? "not reported" : models.map((model) => model.id).join(", ");
+    } catch {
+      modelsText = "not reported";
+    }
     return okResult(
       [
         `backends: ${names.length > 0 ? names.join(", ") : "(none registered)"}`,
         `default: ${opts.defaultBackend}`,
-        `tools: ${prefix}_prompt, ${prefix}_resume, ${prefix}_models, ${prefix}_sessions, ${prefix}_history, ${prefix}_send, ${prefix}_subscribe, ${prefix}_unsubscribe, ${prefix}_abort, ${prefix}_backends`,
-      ].join("\n"),
+        `models (${backend}): ${modelsText}`,
+      ].join("; "),
     );
   }
 
   server.registerTool(
-    `${prefix}_prompt`,
+    `${prefix}_run`,
     {
-      title: "Kagero prompt",
+      title: "Kagero run",
       description:
-        "Run a one-shot prompt through a kagero backend. Returns the assistant text; _meta carries sessionId/status/model/workspace/usage. Timeouts and aborts come back as isError results naming the resumable session — the tool never throws.",
-      inputSchema: PromptInput,
+        `Run a prompt through a kagero backend. Without session_id: fresh run; with session_id: continue that session. ` +
+        `Returns the assistant text; _meta carries sessionId/status/model/workspace/usage. Timeouts and aborts come back ` +
+        `as isError results naming the resumable session — the tool never throws. With run_in_background: true the call ` +
+        `returns {task_id, status: "running"} immediately; poll ${prefix}_task_list / ${prefix}_task_output, stop with ` +
+        `${prefix}_task_stop; a "task-completed" logging notification announces the outcome.`,
+      inputSchema: RunInput,
     },
-    (args, extra) => handlePrompt(args, extra),
+    (args, extra) => handleRun(args, extra),
   );
 
   server.registerTool(
-    `${prefix}_resume`,
+    `${prefix}_send_message`,
     {
-      title: "Kagero resume",
+      title: "Kagero send message",
       description:
-        "Continue a persistent session with a new prompt. Same result shape as kagero_prompt; refuses honestly when the backend has no resume support.",
-      inputSchema: ResumeInput,
+        'Deliver a message into a live session: kind "steer" interrupts the current turn with a new instruction, ' +
+        '"follow_up" queues it for after the turn settles, "abort" stops the in-flight run (the session stays resumable).',
+      inputSchema: SendMessageInput,
     },
-    (args, extra) => handleResume(args, extra),
+    (args) => handleSendMessage(args).catch(toErrorResult),
   );
 
   server.registerTool(
-    `${prefix}_models`,
+    `${prefix}_task_list`,
     {
-      title: "Kagero models",
-      description: "List the models the backend reports.",
-      inputSchema: ModelsInput,
+      title: "Kagero task list",
+      description:
+        "List background runs (run_in_background) tracked by this server: task id, session, status, agent, model, " +
+        "elapsed time. active_only (default) hides finished tasks.",
+      inputSchema: TaskListInput,
       annotations: READ_ONLY,
     },
-    (args) => handleModels(args).catch(toErrorResult),
+    (args) => handleTaskList(args),
   );
 
   server.registerTool(
-    `${prefix}_sessions`,
+    `${prefix}_task_output`,
     {
-      title: "Kagero sessions",
-      description: "List the persistent sessions the backend knows about.",
-      inputSchema: SessionsInput,
+      title: "Kagero task output",
+      description:
+        "Fetch the result of a background task. wait_ms waits up to that long for completion before returning the " +
+        "current status; include_blocks prepends the session's compressed watch-digest blocks when the compressor has " +
+        "checkpointed any.",
+      inputSchema: TaskOutputInput,
       annotations: READ_ONLY,
     },
-    (args) => handleSessions(args).catch(toErrorResult),
+    (args, extra) => handleTaskOutput(args, extra).catch(toErrorResult),
+  );
+
+  server.registerTool(
+    `${prefix}_task_stop`,
+    {
+      title: "Kagero task stop",
+      description:
+        "Cancel a running background task: aborts the underlying run (the session stays resumable) and marks the task canceled.",
+      inputSchema: TaskStopInput,
+    },
+    (args) => handleTaskStop(args).catch(toErrorResult),
   );
 
   server.registerTool(
@@ -677,90 +874,23 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
         "Compact, normalized history of a session (one line per entry, full-log pointer at the end). " +
         "Pages are counted from the newest end: page 0 (default) returns the most recent page_size " +
         `(default ${DEFAULT_HISTORY_PAGE_SIZE}, max ${MAX_HISTORY_PAGE_SIZE}) entries; the footer names ` +
-        "the next older page when one exists.",
+        "the next older page when one exists. When a compressed watch digest exists for the session, its " +
+        "header (status / goal / belief / block count) is prepended on every page.",
       inputSchema: HistoryInput,
       annotations: READ_ONLY,
     },
     (args) => handleHistory(args).catch(toErrorResult),
   );
 
-  if (watchConfig !== undefined) {
-    server.registerTool(
-      `${prefix}_watch`,
-      {
-        title: "Kagero watch",
-        description: WATCH_TOOL_DESCRIPTION(watchConfig),
-        inputSchema: watchInputSchema(watchConfig),
-        annotations: READ_ONLY,
-      },
-      (args) =>
-        handleWatch(
-          {
-            selectAgent,
-            defaultBackend: opts.defaultBackend,
-            config: watchConfig,
-            hub: streamHub,
-          },
-          args as WatchArgs,
-        ).then(
-          (result) => (result.isError ? errorResult(result.text) : okResult(result.text)),
-          toErrorResult,
-        ),
-    );
-  }
-
   server.registerTool(
-    `${prefix}_send`,
+    `${prefix}_info`,
     {
-      title: "Kagero send",
-      description:
-        'Deliver a mid-run message: kind "steer" interrupts the current turn with a new instruction, "follow_up" queues it for after the turn settles.',
-      inputSchema: SendInput,
-    },
-    (args) => handleSend(args).catch(toErrorResult),
-  );
-
-  server.registerTool(
-    `${prefix}_subscribe`,
-    {
-      title: "Kagero subscribe",
-      description:
-        "Subscribe to a session's live events; they arrive as logging messages (level info) tagged with the subscription_id. Detach with kagero_unsubscribe.",
-      inputSchema: SubscribeInput,
-    },
-    (args) => handleSubscribe(args).catch(toErrorResult),
-  );
-
-  server.registerTool(
-    `${prefix}_unsubscribe`,
-    {
-      title: "Kagero unsubscribe",
-      description: "Detach a subscription created by kagero_subscribe.",
-      inputSchema: UnsubscribeInput,
-    },
-    (args) => handleUnsubscribe(args).catch(toErrorResult),
-  );
-
-  server.registerTool(
-    `${prefix}_abort`,
-    {
-      title: "Kagero abort",
-      description:
-        "Abort an in-flight run. Idempotent; the aborted session stays resumable via kagero_resume.",
-      inputSchema: AbortInput,
-    },
-    (args) => handleAbort(args).catch(toErrorResult),
-  );
-
-  server.registerTool(
-    `${prefix}_backends`,
-    {
-      title: "Kagero backends",
-      description: "List registered backends, the default one, and the tool surface.",
-      inputSchema: BackendsInput,
+      title: "Kagero info",
+      description: "Registered backends, the default one, and the models of the active backend.",
+      inputSchema: InfoInput,
       annotations: READ_ONLY,
     },
-    () => handleBackends(),
+    (args) => handleInfo(args).catch(toErrorResult),
   );
 
   return {
@@ -769,14 +899,6 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
       await server.connect(new StdioServerTransport());
     },
     async stop(): Promise<void> {
-      for (const sub of subscriptions.values()) {
-        try {
-          sub.unsubscribe();
-        } catch {
-          // The backend may already be gone; stop must still finish.
-        }
-      }
-      subscriptions.clear();
       // Let in-flight background batch compressions checkpoint (bounded):
       // an MCP timeout/retry must not kill a half-done compression.
       await streamHub?.settleAll(180_000).catch(() => undefined);

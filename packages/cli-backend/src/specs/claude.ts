@@ -30,21 +30,20 @@ const claudeSpec: CliSpec = {
   print: {
     resumeCapable: true,
     args(ctx: PromptContext): string[] {
-      // `--` first: a caller prompt starting with "-" would otherwise be
-      // argv-parsed as an option (live-verified: claude -p "-x test" errors).
-      const args: string[] = ["-p", "--", ctx.prompt, "--output-format", "stream-json"];
-      if (ctx.opts.modelId !== undefined) {
-        args.push("--model", ctx.opts.modelId);
-      }
-      if (ctx.mode === "resume" && ctx.sessionId !== undefined) {
-        args.push("--resume", ctx.sessionId);
-      }
-      if (ctx.opts.maxTurns !== undefined) {
-        args.push("--max-turns", String(ctx.opts.maxTurns));
-      }
-      if (ctx.opts.approvalMode === "yolo") {
-        args.push("--dangerously-skip-permissions");
-      }
+      // All flags BEFORE the prompt; `--` sits last, right before the prompt
+      // positional (a prompt starting with "-" would otherwise be argv-parsed
+      // as an option; live-verified: claude -p "-x test" errors).
+      const args: string[] = [
+        "-p",
+        "--output-format",
+        "stream-json",
+        ...(ctx.opts.modelId === undefined ? [] : ["--model", ctx.opts.modelId]),
+        ...(ctx.mode === "resume" && ctx.sessionId !== undefined ? ["--resume", ctx.sessionId] : []),
+        ...(ctx.opts.maxTurns !== undefined ? ["--max-turns", String(ctx.opts.maxTurns)] : []),
+        ...(ctx.opts.approvalMode === "yolo" ? ["--dangerously-skip-permissions"] : []),
+        "--",
+        ctx.prompt,
+      ];
       return args;
     },
     parse: (stdout) => parseClaudeLineage(stdout, { usageStyle: "claude" }),
