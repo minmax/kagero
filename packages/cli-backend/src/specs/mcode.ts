@@ -45,7 +45,9 @@ export function mcodeModelOptionValue(modelId: string): string {
   if (separator === -1) return `m:${encodeURIComponent(modelPart)}:u`;
   const provider = modelPart.slice(0, separator);
   const model = modelPart.slice(separator + 1);
-  const variantSuffix = variant === undefined ? "u" : `v:${encodeURIComponent(variant)}`;
+  // Advertised option values use ":v:" with an EMPTY variant for the bare
+  // model (live: "m:minimax:MiniMax-M3:v:") — ":u" is never advertised.
+  const variantSuffix = variant === undefined || variant === "" ? "v:" : `v:${encodeURIComponent(variant)}`;
   return `m:${encodeURIComponent(provider)}:${encodeURIComponent(model)}:${variantSuffix}`;
 }
 
