@@ -3,7 +3,7 @@
  *
  * The pi backends live in @kagero/pi-backend; the seven CLI wrappers are
  * data-driven CliSpecs from @kagero/cli-backend, each registered as a
- * CliSpecAgent over its spec (see docs/LIB-PLAN.md §6). Nothing else may
+ * CliSpecAgent over its spec. Nothing else may
  * hardcode backend names.
  */
 

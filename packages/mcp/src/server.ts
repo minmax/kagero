@@ -1,7 +1,7 @@
 /**
  * server.ts — the MCP facade over the Agent contract.
  *
- * One factory, ten honest tools. Design rules (docs/LIB-PLAN.md §4):
+ * One factory, ten honest tools. Design rules:
  *  - The server advertises `{ tools: {}, logging: {} }`: without the logging
  *    capability `sendLoggingMessage` is a silent no-op and subscribe would
  *    swallow every agent event (the P0 from the v0.1 audit).

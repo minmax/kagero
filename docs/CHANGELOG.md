@@ -7,7 +7,7 @@
 
 Это patch-релиз с hardening v0.1.0: закрывает реальные resource-leaks,
 race conditions и security-разрывы, найденные в ходе multi-faceted review
-(см. `docs/PROCESS.md`). **Никаких breaking changes** в публичном API
+**Никаких breaking changes** в публичном API
 (`Agent` интерфейс и набор MCP tools обратно совместимы).
 
 ### Security

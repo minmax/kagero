@@ -13,3 +13,7 @@ sessions/
 state/
 *.jsonl
 node-compile-cache/
+
+# build artifacts
+*.js.map
+*.d.ts.map

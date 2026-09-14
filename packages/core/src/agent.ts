@@ -4,7 +4,7 @@
  * Every concrete backend (pi SDK, pi RPC, CLI wrappers) implements this
  * interface. The MCP server and CLI depend only on this contract.
  *
- * Contract rules (see docs/LIB-PLAN.md §4.0):
+ * Contract rules:
  *  - Responses always carry the final assistant `text` and, when the backend
  *    produced one, the `sessionId` — a caller must never need a second call
  *    to learn what session to resume.

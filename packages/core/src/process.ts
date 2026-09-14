@@ -1,7 +1,7 @@
 /**
  * process.ts — the one subprocess runner for all print-style CLI transports.
  *
- * Contract (see docs/LIB-PLAN.md §4):
+ * Contract:
  *  - The child is spawned detached into its own process group; the stop
  *    ladder is SIGTERM to the group, then SIGKILL after `killGraceMs`, then a
  *    control sweep of the group. kill(-pid) is guarded to pid > 0 — killing
