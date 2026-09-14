@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // A stand-in live stream-json `claude` for the claude-stream transport tests.
 // Speaks the niwa-ported protocol: user turns on stdin, frames on stdout,
-// control_request initialize handshake, can_use_tool reverse requests.
+// control_request initialize handshake, can_use_tool reverse requests,
+// native control subtypes (echoed back with success + the requested subtype).
 //
 // Env:
 //   FAKE_CLAUDE_MODE    echo (default) | deny  — deny rejects every prompt via
@@ -9,6 +10,9 @@
 
 let buffer = "";
 let turn = 0;
+let reverseSeq = 0;
+let lastReverseRequestId;
+let lastReverseReply;
 
 const send = (frame) => process.stdout.write(`${JSON.stringify(frame)}\n`);
 
@@ -24,11 +28,17 @@ const answer = (sessionId, userText) => {
     });
     return;
   }
+  // Tag the answer with the reply the boundary sent for our reverse
+  // control_request, so tests can assert the response shape end-to-end.
+  const reverseTag =
+    lastReverseReply === undefined
+      ? ""
+      : ` [reverse:${lastReverseReply.subtype}:${lastReverseReply.error ?? ""}]`;
   send({
     type: "assistant",
     message: {
       model: "haiku",
-      content: [{ type: "text", text: `PONG: ${userText}` }],
+      content: [{ type: "text", text: `PONG: ${userText}${reverseTag}` }],
     },
     session_id: sessionId,
   });
@@ -50,19 +60,63 @@ const onLine = (line) => {
   } catch {
     return;
   }
+  if (frame.type === "control_response") {
+    // A reply to OUR reverse control_request — record it for the answer tag.
+    if (lastReverseRequestId !== undefined && frame.response?.request_id === lastReverseRequestId) {
+      lastReverseReply = frame.response;
+    }
+    return;
+  }
   if (frame.type === "control_request") {
-    // initialize → success; interrupt → success (turn result follows from echo)
+    const subtype = frame.request?.subtype;
+    // interrupt → success receipt (only when cancel_queued rode the wire)
+    // plus the result frame the cancelled turn delivers on its own.
+    if (subtype === "interrupt") {
+      const receipt =
+        frame.request?.cancel_queued === true
+          ? { still_queued: [], cancelled: ["fake-msg-interrupted"] }
+          : {};
+      send({
+        type: "control_response",
+        response: { subtype: "success", request_id: frame.request_id, response: receipt },
+      });
+      if (lastSession !== undefined) {
+        send({
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          result: "interrupted",
+          session_id: lastSession,
+        });
+      }
+      return;
+    }
+    // Generic echo: success + the requested subtype, so tests can prove which
+    // control shape hit the wire.
     send({
       type: "control_response",
-      response: { subtype: "success", request_id: frame.request_id },
+      response: { subtype: "success", request_id: frame.request_id, echoed_subtype: subtype },
     });
-    if (frame.request?.subtype === "interrupt" && lastSession !== undefined) {
+    if (subtype === "initialize") {
+      // Poke one reverse control_request the boundary must classify.
+      reverseSeq += 1;
+      lastReverseRequestId = `fake-reverse-${reverseSeq}`;
       send({
-        type: "result",
-        subtype: "success",
-        is_error: false,
-        result: "interrupted",
-        session_id: lastSession,
+        type: "control_request",
+        request_id: lastReverseRequestId,
+        request: { subtype: "hook_callback", hook_name: "PreToolUse" },
+      });
+    }
+    if (subtype === "set_model" && typeof frame.request?.model === "string") {
+      const sessionId = lastSession ?? `fake-claude-${Date.now()}`;
+      lastSession = sessionId;
+      send({
+        type: "assistant",
+        message: {
+          model: frame.request.model,
+          content: [{ type: "text", text: `[model set: ${frame.request.model}]` }],
+        },
+        session_id: sessionId,
       });
     }
     return;

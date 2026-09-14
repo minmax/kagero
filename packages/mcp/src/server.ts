@@ -215,7 +215,8 @@ interface RunOptionsDraft {
   maxTurns?: number;
   maxToolCalls?: number;
   approvalMode?: "default" | "yolo";
-  additionalDirs?: readonly string[];
+  additionalDirs?: readonly string[] | undefined;
+  nativeOverrides?: readonly string[] | undefined;
   workspace?: WorkspaceOption;
   sessionId?: string;
 }

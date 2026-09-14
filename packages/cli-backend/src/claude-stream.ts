@@ -8,12 +8,18 @@
  * stream-json --include-partial-messages` process per model. Protocol:
  *  - stdin: user turns `{type:"user",message:{role:"user",content:[{type:
  *    "text","text":...}]}}`, control requests `{type:"control_request",
- *    request_id,request:{subtype:"initialize"|"interrupt"}}`;
+ *    request_id,request:{subtype,...}}` — initialize, interrupt (sent with
+ *    `cancel_queued:true`; the success receipt carries `still_queued`/
+ *    `cancelled`), and the native subtypes set_model, set_permission_mode,
+ *    set_max_thinking_tokens, apply_flag_settings, seed_read_state,
+ *    cancel_async_message, end_session (all via nativeControl);
  *  - stdout: `{type:"system"|"assistant"|"stream_event"|"result"|
  *    "rate_limit_event",...}` frames, each carrying session_id; REVERSE
- *    `control_request` frames (`can_use_tool`) must be answered — this
- *    boundary has no approval authority, so the reply is fail-closed deny
- *    (the niwa pattern); `control_response` frames settle our requests.
+ *    `control_request` frames are classified: `can_use_tool` is answered
+ *    fail-closed deny (no approval authority here — the niwa pattern),
+ *    `hook_callback`/`request_user_dialog`/`control_cancel_request` get an
+ *    error-shaped control_response (harmless), everything unknown gets
+ *    nothing; `control_response` frames settle our requests.
  *
  * Turn lifecycle: a user turn line starts a turn; the `result` frame ends it
  * (the same envelope the print transport parses). A second user line while
@@ -43,6 +49,76 @@ type Frame = Record<string, unknown>;
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 const str = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
+
+/** Result of one native control round-trip (control_response correlated by request_id). */
+interface ControlResult {
+  readonly success: boolean;
+  /**
+   * The full success body: receipts (interrupt `still_queued`/`cancelled`)
+   * and advertised data (initialize `commands`) live on it or nested under
+   * `response`.
+   */
+  readonly payload: Frame;
+  readonly error?: string;
+}
+
+/** Permission modes the native `set_permission_mode` control accepts (claude 2.1.270 wire). */
+export type ClaudePermissionMode =
+  | "acceptEdits"
+  | "auto"
+  | "bypassPermissions"
+  | "manual"
+  | "dontAsk"
+  | "plan";
+
+/** Receipt echoed by the interrupt control_response when `cancel_queued` was set. */
+export interface InterruptReceipt {
+  readonly stillQueued: readonly string[];
+  readonly cancelled: readonly string[];
+}
+
+/** Slash command advertised by the initialize control_response. */
+export interface SlashCommand {
+  readonly name: string;
+  readonly description: string;
+}
+
+/**
+ * Interrupt receipt parser — the `{still_queued,cancelled}` lists may live
+ * directly on the success body or nested one level down (`response.response`)
+ * depending on CLI version; read both, defensively.
+ */
+const parseInterruptReceipt = (payload: Frame): InterruptReceipt => {
+  const nested = isRecord(payload["response"]) ? payload["response"] : undefined;
+  const list = (key: string): string[] => {
+    for (const source of [payload, nested]) {
+      const value = source?.[key];
+      if (Array.isArray(value)) {
+        return value.filter((entry): entry is string => typeof entry === "string");
+      }
+    }
+    return [];
+  };
+  return { stillQueued: list("still_queued"), cancelled: list("cancelled") };
+};
+
+/** Initialize `commands[]` parser — same defensive nesting as the receipt. */
+const parseSlashCommands = (payload: Frame): SlashCommand[] => {
+  const nested = isRecord(payload["response"]) ? payload["response"] : undefined;
+  for (const source of [payload, nested]) {
+    const raw = source?.["commands"];
+    if (!Array.isArray(raw)) continue;
+    const commands: SlashCommand[] = [];
+    for (const entry of raw) {
+      if (!isRecord(entry)) continue;
+      const name = str(entry["name"]);
+      if (name === undefined) continue;
+      commands.push({ name, description: str(entry["description"]) ?? "" });
+    }
+    return commands;
+  }
+  return [];
+};
 
 interface ActiveTurn {
   sessionId: string;
@@ -87,12 +163,21 @@ export class ClaudeStreamAgent implements Agent {
   private active: ActiveTurn | undefined;
   private handshakeSucceeded = false;
   private handshakeStarted = false;
-  /** Reverse can_use_tool requests are answered fail-closed (niwa pattern). */
-  private readonly pendingControl = new Map<
-    string,
-    { settled: () => void; failed: (error: AgentError) => void }
-  >();
+  /** Control round-trips in flight, keyed by request_id (initialize/interrupt/native subtypes). */
+  private readonly pendingControl = new Map<string, (result: ControlResult) => void>();
   private controlSeq = 0;
+  private interruptReceipt: InterruptReceipt | undefined;
+  private slashCommandList: readonly SlashCommand[] = [];
+
+  /** Commands advertised by the last successful initialize handshake (empty when none). */
+  get slashCommands(): readonly SlashCommand[] {
+    return this.slashCommandList;
+  }
+
+  /** Receipt of the most recent interrupt, when its control_response carried one. */
+  get lastInterruptReceipt(): InterruptReceipt | undefined {
+    return this.interruptReceipt;
+  }
 
   // ===========================================================================
   // Agent interface
@@ -139,9 +224,10 @@ export class ClaudeStreamAgent implements Agent {
   async abort(sessionId: string): Promise<void> {
     const active = this.active;
     if (active !== undefined && active.sessionId === sessionId && !active.finished) {
-      this.writeControlRequest("interrupt");
+      this.writeInterrupt();
       // The interrupt control_response (or the turn's result frame) settles
-      // the turn; a watchdog resolves it if the CLI never answers.
+      // the turn; a watchdog resolves it if the CLI never answers. Cancelled
+      // turns deliver their own result frames — never pre-settle here.
       setTimeout(() => {
         const current = this.active;
         if (current !== undefined && current.sessionId === sessionId && !current.finished) {
@@ -168,6 +254,46 @@ export class ClaudeStreamAgent implements Agent {
   }
 
   // ===========================================================================
+  // Native control channel
+  // ===========================================================================
+
+  /**
+   * Send one native control request and await its correlated control_response
+   * (10s ceiling). Never throws — failures come back as `{success:false}`.
+   * The remaining verified subtypes ride this directly: seed_read_state
+   * (`{path}`), cancel_async_message (`{message_uuid}`), end_session
+   * (`{reason}`).
+   */
+  async nativeControl(subtype: string, extra?: Record<string, unknown>): Promise<ControlResult> {
+    try {
+      const { promise } = this.writeControlRequest(subtype, extra);
+      return await promise;
+    } catch (err) {
+      return { success: false, payload: {}, error: (err as Error).message };
+    }
+  }
+
+  /** Switch the model on the live proc (native `set_model`); false if the CLI refused. */
+  async setModel(modelId: string): Promise<boolean> {
+    return (await this.nativeControl("set_model", { model: modelId })).success;
+  }
+
+  /** Switch the permission mode mid-session (native `set_permission_mode`). */
+  async setPermissionMode(mode: ClaudePermissionMode): Promise<boolean> {
+    return (await this.nativeControl("set_permission_mode", { mode })).success;
+  }
+
+  /** Set the thinking-token budget (native `set_max_thinking_tokens`). */
+  async setMaxThinkingTokens(max: number): Promise<boolean> {
+    return (await this.nativeControl("set_max_thinking_tokens", { max })).success;
+  }
+
+  /** Apply CLI flag key/values to the live session (native `apply_flag_settings`). */
+  async applyFlagSettings(settings: Record<string, unknown>): Promise<boolean> {
+    return (await this.nativeControl("apply_flag_settings", { settings })).success;
+  }
+
+  // ===========================================================================
   // Turn lifecycle
   // ===========================================================================
 
@@ -178,53 +304,67 @@ export class ClaudeStreamAgent implements Agent {
         ? `claude-${opts.sessionId}`
         : `claude-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     return new Promise<AgentResponse>((settle, fail) => {
-      let proc: ChildProcess;
-      try {
-        proc = this.start(opts.modelId, opts.sessionId);
-      } catch (err) {
+      const failStart = (err: unknown): void => {
         fail(err instanceof AgentError ? err : new AgentError("spawn_failed", (err as Error).message, "tool"));
-        return;
-      }
-      if (this.handshakeSucceeded === false && this.handshakeStarted === false) {
-        this.handshakeStarted = true;
-        this.writeControlRequest("initialize");
-      }
-      let timer: NodeJS.Timeout | undefined;
-      this.active = {
-        sessionId,
-        text: [],
-        thinking: [],
-        model: undefined,
-        usage: undefined,
-        errorMessage: undefined,
-        finished: false,
-        settled: (response) => {
-          if (timer !== undefined) clearTimeout(timer);
-          settle({ ...response, durationMs: Date.now() - startedAt });
-        },
-        failed: (error) => {
-          if (timer !== undefined) clearTimeout(timer);
-          fail(error);
-        },
       };
-      const startedAt = Date.now();
-      this.emit(sessionId, { type: "session-start", sessionId, at: new Date().toISOString() });
-      this.emit(sessionId, { type: "user-prompt", content: prompt, at: new Date().toISOString() });
-      this.writeUserTurn(prompt);
-      void proc; // close/error handlers own the failure path
-      if (opts.timeoutMs !== undefined) {
-        timer = setTimeout(() => {
-          const active = this.active;
-          if (active === undefined || active.finished || active.sessionId !== sessionId) return;
-          this.writeControlRequest("interrupt");
-          timer = setTimeout(() => {
-            const current = this.active;
-            if (current !== undefined && current.sessionId === sessionId && !current.finished) {
-              this.finishTimedOut(current);
+      // start() may round-trip a live set_model control before the turn —
+      // the user turn is only written once the process is settled.
+      void this.start(opts.modelId, opts.sessionId).then(
+        (proc) => {
+          try {
+            if (this.handshakeSucceeded === false && this.handshakeStarted === false) {
+              this.handshakeStarted = true;
+              const { promise } = this.writeControlRequest("initialize");
+              void promise.then((result) => {
+                if (result.success) {
+                  this.handshakeSucceeded = true;
+                  // commands[] absent → discarded (kept empty).
+                  this.slashCommandList = parseSlashCommands(result.payload);
+                }
+              });
             }
-          }, 5_000);
-        }, opts.timeoutMs);
-      }
+            let timer: NodeJS.Timeout | undefined;
+            this.active = {
+              sessionId,
+              text: [],
+              thinking: [],
+              model: undefined,
+              usage: undefined,
+              errorMessage: undefined,
+              finished: false,
+              settled: (response) => {
+                if (timer !== undefined) clearTimeout(timer);
+                settle({ ...response, durationMs: Date.now() - startedAt });
+              },
+              failed: (error) => {
+                if (timer !== undefined) clearTimeout(timer);
+                fail(error);
+              },
+            };
+            const startedAt = Date.now();
+            this.emit(sessionId, { type: "session-start", sessionId, at: new Date().toISOString() });
+            this.emit(sessionId, { type: "user-prompt", content: prompt, at: new Date().toISOString() });
+            this.writeUserTurn(prompt);
+            void proc; // close/error handlers own the failure path
+            if (opts.timeoutMs !== undefined) {
+              timer = setTimeout(() => {
+                const active = this.active;
+                if (active === undefined || active.finished || active.sessionId !== sessionId) return;
+                this.writeInterrupt();
+                timer = setTimeout(() => {
+                  const current = this.active;
+                  if (current !== undefined && current.sessionId === sessionId && !current.finished) {
+                    this.finishTimedOut(current);
+                  }
+                }, 5_000);
+              }, opts.timeoutMs);
+            }
+          } catch (err) {
+            failStart(err);
+          }
+        },
+        failStart,
+      );
     });
   }
 
@@ -271,9 +411,19 @@ export class ClaudeStreamAgent implements Agent {
   // Process + protocol pump
   // ===========================================================================
 
-  private start(model: string | undefined, resumeId: string | undefined): ChildProcess {
-    if (this.proc !== null && this.procModel === model && this.procResumeId === (resumeId ?? undefined)) {
-      return this.proc;
+  private async start(model: string | undefined, resumeId: string | undefined): Promise<ChildProcess> {
+    const live = this.proc;
+    if (live !== null && this.procResumeId === (resumeId ?? undefined)) {
+      if (this.procModel === model) return live;
+      if (model !== undefined) {
+        // A live proc can switch models in place: try the native set_model
+        // control first, and only pay for a respawn if the CLI refuses it.
+        const result = await this.nativeControl("set_model", { model });
+        if (result.success && this.proc === live) {
+          this.procModel = model;
+          return live;
+        }
+      }
     }
     if (this.proc !== null) this.stopProc();
     const bin = resolveBinary("claude", "CLAUDE_STREAM_BIN").path;
@@ -311,6 +461,7 @@ export class ClaudeStreamAgent implements Agent {
         this.handshakeSucceeded = false;
         this.handshakeStarted = false;
         this.failActive("claude stream subprocess closed before the turn settled");
+        this.failPendingControl("claude stream subprocess closed before the control settled");
       }
     });
     this.proc = proc;
@@ -323,6 +474,7 @@ export class ClaudeStreamAgent implements Agent {
     const proc = this.proc;
     this.proc = null;
     this.procModel = undefined;
+    this.failPendingControl("claude stream subprocess stopped before the control settled");
     if (proc !== null) {
       try {
         proc.stdin?.end();
@@ -334,6 +486,15 @@ export class ClaudeStreamAgent implements Agent {
       } catch {
         // already gone
       }
+    }
+  }
+
+  /** Settle every in-flight control round-trip as failed (proc gone). */
+  private failPendingControl(message: string): void {
+    const pending = [...this.pendingControl.entries()];
+    this.pendingControl.clear();
+    for (const [, settle] of pending) {
+      settle({ success: false, payload: {}, error: message });
     }
   }
 
@@ -359,7 +520,7 @@ export class ClaudeStreamAgent implements Agent {
     const at = new Date().toISOString();
     const type = str(frame["type"]);
 
-    // Our control requests settle here (initialize / interrupt).
+    // Our control requests settle here (initialize / interrupt / native).
     if (type === "control_response") {
       const requestId = str(frame["request_id"]);
       if (requestId === undefined) return;
@@ -367,28 +528,59 @@ export class ClaudeStreamAgent implements Agent {
       if (pending === undefined) return;
       this.pendingControl.delete(requestId);
       const body = isRecord(frame["response"]) ? frame["response"] : undefined;
-      if (body !== undefined && body["subtype"] === "success") pending.settled();
-      else pending.failed(new AgentError("cli_error", str(body?.["error"]) ?? "control request failed", "tool", {}));
+      if (body !== undefined && body["subtype"] === "success") {
+        // The whole success body is the payload: the interrupt receipt and
+        // the initialize commands live on it (or nested under `response`).
+        pending({ success: true, payload: body });
+      } else {
+        pending({
+          success: false,
+          payload: body ?? {},
+          error: str(body?.["error"]) ?? "control request failed",
+        });
+      }
       return;
     }
 
-    // Reverse control request: can_use_tool — no approval authority here.
+    // Reverse control requests, classified: can_use_tool is answered
+    // fail-closed deny (no approval authority here — the niwa pattern);
+    // interactive subtypes we cannot serve headless get an explicit
+    // error-shaped control_response so the CLI never waits; anything else
+    // unknown is ignored.
     if (type === "control_request") {
       const requestId = str(frame["request_id"]);
       if (requestId === undefined) return;
-      this.writeLine(
-        JSON.stringify({
-          type: "control_response",
-          response: {
-            subtype: "success",
-            request_id: requestId,
+      const request = isRecord(frame["request"]) ? frame["request"] : undefined;
+      const subtype = str(request?.["subtype"]);
+      if (subtype === "can_use_tool") {
+        this.writeLine(
+          JSON.stringify({
+            type: "control_response",
             response: {
-              behavior: "deny",
-              message: "claude-stream has no interactive permission authority",
+              subtype: "success",
+              request_id: requestId,
+              response: {
+                behavior: "deny",
+                message: "claude-stream has no interactive permission authority",
+              },
             },
-          },
-        }),
-      );
+          }),
+        );
+        return;
+      }
+      if (
+        subtype === "hook_callback" ||
+        subtype === "request_user_dialog" ||
+        subtype === "control_cancel_request"
+      ) {
+        this.writeLine(
+          JSON.stringify({
+            type: "control_response",
+            response: { subtype: "error", request_id: requestId, error: "not supported headless" },
+          }),
+        );
+        return;
+      }
       return;
     }
 
@@ -548,28 +740,44 @@ export class ClaudeStreamAgent implements Agent {
     );
   }
 
-  private writeControlRequest(subtype: "initialize" | "interrupt"): void {
+  /**
+   * The one control-request writer: fresh request_id (same scheme as
+   * initialize/interrupt always used), promise correlated by the
+   * pendingControl map, 10s timeout. The promise never rejects — failures
+   * (timeout, dead proc) resolve `{success:false}`.
+   */
+  private writeControlRequest(
+    subtype: string,
+    extra: Record<string, unknown> = {},
+  ): { requestId: string; promise: Promise<ControlResult> } {
     this.controlSeq += 1;
     const requestId = `kagero-control-${Date.now()}-${this.controlSeq}`;
-    const promise = new Promise<void>((settled, failed) => {
-      this.pendingControl.set(requestId, { settled, failed });
+    const request: Frame = { subtype, ...extra };
+    const promise = new Promise<ControlResult>((settled) => {
+      this.pendingControl.set(requestId, settled);
       setTimeout(() => {
-        if (this.pendingControl.delete(requestId)) failed(new AgentError("cli_error", "timeout", "tool"));
+        if (this.pendingControl.delete(requestId)) {
+          settled({ success: false, payload: {}, error: "control request timed out" });
+        }
       }, 10_000);
     });
     this.writeLine(
-      JSON.stringify({ type: "control_request", request_id: requestId, request: { subtype } }),
+      JSON.stringify({ type: "control_request", request_id: requestId, request }),
     );
-    if (subtype === "initialize") {
-      void promise.then(
-        () => {
-          this.handshakeSucceeded = true;
-        },
-        () => undefined,
-      );
-    } else {
-      void promise.catch(() => undefined);
-    }
+    return { requestId, promise };
+  }
+
+  /**
+   * Interrupt the active turn with `cancel_queued:true` and record the
+   * success receipt (`still_queued`/`cancelled`). Cancelled turns deliver
+   * their own result frames — nothing is pre-settled here; the watchdog in
+   * the caller still classifies a silent CLI as aborted/timed-out.
+   */
+  private writeInterrupt(): void {
+    const { promise } = this.writeControlRequest("interrupt", { cancel_queued: true });
+    void promise.then((result) => {
+      if (result.success) this.interruptReceipt = parseInterruptReceipt(result.payload);
+    });
   }
 
   // ---------------------------------------------------------------------------

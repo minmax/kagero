@@ -1,7 +1,8 @@
 // Tests for the claude-stream transport (ported from niwa's live stream-json
 // protocol) against a fake claude subprocess: user turn → system/assistant/
 // result frames, control_request initialize handshake, can_use_tool deny,
-// steer as a second user turn, is_error failures, abort.
+// steer as a second user turn, is_error failures, abort, native control
+// subtypes (set_model / interrupt receipt / reverse hook_callback).
 
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -74,6 +75,47 @@ describe("claude-stream agent", () => {
   }, 15000);
 });
 
+describe("control subtypes", () => {
+  it("setModel switches the model in place over native control (no respawn)", async () => {
+    const { agent } = await makeAgent("echo");
+    const texts: string[] = [];
+    agent.subscribe("*", (e) => {
+      if (e.type === "assistant-text") texts.push(e.content);
+    });
+    const first = await agent.prompt("turn one", {});
+    expect(await agent.setModel("mistral")).toBe(true);
+    const second = await agent.prompt("turn two", { modelId: "mistral" });
+    expect(second.status).toBe("completed");
+    // Same fake process answered both turns — the model switch did not respawn.
+    expect(second.sessionId).toBe(first.sessionId);
+    // The fake proves the set_model control hit the wire by echoing it back.
+    expect(texts.join("\n")).toContain("[model set: mistral]");
+  }, 15000);
+
+  it("interrupt sends cancel_queued and surfaces the receipt", async () => {
+    const { agent } = await makeAgent("echo");
+    const turn = agent.resume("fixed", "long running work", {});
+    await sleep(10); // let the turn go active before aborting
+    await agent.abort("claude-fixed");
+    // The turn settles via its own interrupt result frame — not pre-settled.
+    const response = await turn;
+    expect(response.status).toBe("completed");
+    // The fake only emits the receipt when cancel_queued rode the wire.
+    const receipt = await waitFor(() => agent.lastInterruptReceipt);
+    expect(receipt.cancelled).toEqual(["fake-msg-interrupted"]);
+    expect(receipt.stillQueued).toEqual([]);
+  }, 15000);
+
+  it("reverse hook_callback gets an error-shaped control_response (not the deny shape)", async () => {
+    const { agent } = await makeAgent("echo");
+    const response = await agent.prompt("probe", {});
+    expect(response.status).toBe("completed");
+    // The fake tags its answer with the reply it received for hook_callback:
+    // subtype "error" + "not supported headless", never the deny shape.
+    expect(response.text).toContain("[reverse:error:not supported headless]");
+  }, 15000);
+});
+
 function makeAgentSync(): ClaudeStreamAgent {
   const dir = mkdtempSync(join(tmpdir(), "kagero-claude-stream-"));
   const bin = join(dir, "fake-claude");
@@ -81,4 +123,16 @@ function makeAgentSync(): ClaudeStreamAgent {
   chmodSync(bin, 0o755);
   process.env["CLAUDE_STREAM_BIN"] = bin;
   return new ClaudeStreamAgent();
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitFor<T>(fn: () => T | undefined, timeoutMs = 2000): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = fn();
+    if (value !== undefined) return value;
+    if (Date.now() > deadline) throw new Error("waitFor: timed out");
+    await sleep(10);
+  }
 }

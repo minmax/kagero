@@ -97,14 +97,14 @@ export interface PromptOptions {
   /** Raw stdout chunks as they arrive (print transports; best-effort). */
   readonly onStream?: (chunk: string) => void;
   /** Extra tool-access directories for the session (ACP newSession; kimi honors). */
-  readonly additionalDirs?: readonly string[];
+  readonly additionalDirs?: readonly string[] | undefined;
   /** Reasoning/thinking effort for the session (config option where the CLI supports it). */
-  readonly thinkingEffort?: string;
+  readonly thinkingEffort?: string | undefined;
   /**
    * Native per-run config overrides, verbatim: codex `-c key=value` pairs,
    * dsh `--patch <file>` paths, etc. The spec decides how each is carried.
    */
-  readonly nativeOverrides?: readonly string[];
+  readonly nativeOverrides?: readonly string[] | undefined;
 }
 
 /** Per-event payload for live observation. */
