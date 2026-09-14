@@ -521,13 +521,15 @@ export class ClaudeStreamAgent implements Agent {
     const type = str(frame["type"]);
 
     // Our control requests settle here (initialize / interrupt / native).
+    // The real CLI nests request_id inside `response`; accept a top-level one
+    // too, defensively.
     if (type === "control_response") {
-      const requestId = str(frame["request_id"]);
+      const body = isRecord(frame["response"]) ? frame["response"] : undefined;
+      const requestId = str(frame["request_id"]) ?? str(body?.["request_id"]);
       if (requestId === undefined) return;
       const pending = this.pendingControl.get(requestId);
       if (pending === undefined) return;
       this.pendingControl.delete(requestId);
-      const body = isRecord(frame["response"]) ? frame["response"] : undefined;
       if (body !== undefined && body["subtype"] === "success") {
         // The whole success body is the payload: the interrupt receipt and
         // the initialize commands live on it (or nested under `response`).
