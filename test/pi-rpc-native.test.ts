@@ -8,11 +8,11 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentEvent } from "@kagero/core";
 import { AgentError } from "@kagero/core";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 // NOTE: import the .ts source directly — packages/pi-backend/src carries stale
 // committed build artifacts (pi-rpc.js / pi-sdk.js / *.d.ts), and a `.js`
 // import would resolve to those instead of the TypeScript source under vite.
 import { PiRpcAgent } from "../packages/pi-backend/src/pi-rpc.ts";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 const FAKE_PI = fileURLToPath(new URL("./helpers/fake-pi-rpc.mjs", import.meta.url));
 
@@ -118,15 +118,19 @@ describe("PiRpcAgent — native rpc commands (fake pi)", () => {
     expect(events.some((e) => e.type === "error")).toBe(false);
   });
 
-  it("setModel writes provider + modelId with an id; a wire failure rejects with pi's error", async () => {
+  it("setModel writes provider + modelId with an id on the wire", async () => {
     const a = startAgent();
     await a.setModel("bifrost", "agnes/agnes-3.0-flash");
     const frame = readWire().find((f) => f.type === "set_model");
     expect(frame).toMatchObject({ provider: "bifrost", modelId: "agnes/agnes-3.0-flash" });
     expect(typeof frame?.["id"]).toBe("string");
+  });
 
+  it("setModel rejects with pi's error text when pi answers success:false", async () => {
+    // The fake reads its env at spawn, so the failure must be armed first.
     process.env["FAKE_PI_FAIL"] = "set_model";
     process.env["FAKE_PI_FAIL_ERROR"] = "Model not found: bifrost/nope";
+    const a = startAgent();
     await expect(a.setModel("bifrost", "nope")).rejects.toThrow(/Model not found/);
   });
 
