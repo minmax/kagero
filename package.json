@@ -1,7 +1,7 @@
 {
   "name": "kagero-mcp",
   "version": "0.1.0",
-  "description": "Kagero — MCP-bait для agentic мира. Common Agent interface поверх pi SDK и CLI-агентов (dsh, qwen, grok, kimi, mcode). Тень от niwa.",
+  "description": "Kagero — one Agent interface over coding-agent CLIs (pi, claude, codex, dsh, grok, kimi, mcode, qwen), exposed as an MCP server and a CLI.",
   "type": "module",
   "bin": {
     "kagero-mcp": "dist/cli.js",
