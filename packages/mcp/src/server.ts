@@ -96,6 +96,7 @@ function runOptionFields() {
     max_tool_calls: z.number().int().positive().optional(),
     approval_mode: z.enum(["default", "yolo"]).optional(),
     additional_dirs: z.array(z.string()).optional(),
+    thinking_effort: z.string().optional(),
   };
 }
 
@@ -196,6 +197,8 @@ interface RunArgsLike {
   max_tool_calls?: number | undefined;
   approval_mode?: "default" | "yolo" | undefined;
   additional_dirs?: string[] | undefined;
+  thinking_effort?: string | undefined;
+
   workspace_create?: boolean | undefined;
   workspace_path?: string | undefined;
   session_id?: string | undefined;
@@ -205,6 +208,7 @@ interface RunArgsLike {
 interface RunOptionsDraft {
   cwd?: string;
   modelId?: string;
+  thinkingEffort?: string;
   timeoutMs?: number;
   maxTurns?: number;
   maxToolCalls?: number;
@@ -422,6 +426,8 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
     if (args.max_tool_calls !== undefined) draft.maxToolCalls = args.max_tool_calls;
     if (args.approval_mode !== undefined) draft.approvalMode = args.approval_mode;
     if (args.additional_dirs !== undefined) draft.additionalDirs = args.additional_dirs;
+    if (args.thinking_effort !== undefined) draft.thinkingEffort = args.thinking_effort;
+
     if (includeSessionId && args.session_id !== undefined) draft.sessionId = args.session_id;
     if (args.workspace_create === true) {
       draft.workspace =

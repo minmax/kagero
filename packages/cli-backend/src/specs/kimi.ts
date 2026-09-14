@@ -28,7 +28,7 @@
 import type { ModelInfo } from "@kagero/core";
 import { createKimiHistoryReader } from "../history-readers/index.js";
 import { parseKimiRoles } from "../parse/kimi-roles.js";
-import type { CliSpec, PromptContext } from "../spec.js";
+import type { AcpConfigOption,  CliSpec, PromptContext } from "../spec.js";
 
 const kimiSpec: CliSpec = {
   name: "kimi",
@@ -57,8 +57,28 @@ const kimiSpec: CliSpec = {
     args: ["acp"],
     protocolVersion: 1,
     modeId: (ctx) => (ctx.opts.approvalMode === "yolo" ? "yolo" : undefined),
-    configOptions: (ctx) =>
-      ctx.opts.modelId === undefined ? [] : [{ configId: "model", value: ctx.opts.modelId }],
+    // kimi 0.42 honors additionalDirectories on session/new (server.ts:247-251).
+    additionalDirectories: true,
+    configOptions: (ctx) => {
+      const options: AcpConfigOption[] = [];
+      if (ctx.opts.modelId !== undefined) {
+        options.push({ configId: "model", value: ctx.opts.modelId });
+      }
+      // thinking: live-verified accepted set low|high|max (server.ts:493-505;
+      // medium → -32602 "Unknown thinking value").
+      if (ctx.opts.thinkingEffort !== undefined) {
+        options.push({ configId: "thinking", value: ctx.opts.thinkingEffort });
+      }
+      return options;
+    },
+    nativeMethods: [
+      "session/list",
+      "session/fork",
+      "session/delete",
+      "session/close",
+      "session/set_model",
+      "session/set_config_option",
+    ],
   },
 
   models: {

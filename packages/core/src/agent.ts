@@ -98,6 +98,8 @@ export interface PromptOptions {
   readonly onStream?: (chunk: string) => void;
   /** Extra tool-access directories for the session (ACP newSession; kimi honors). */
   readonly additionalDirs?: readonly string[];
+  /** Reasoning/thinking effort for the session (config option where the CLI supports it). */
+  readonly thinkingEffort?: string;
 }
 
 /** Per-event payload for live observation. */
