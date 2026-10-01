@@ -28,6 +28,7 @@ const codexSpec: CliSpec = {
   binary: "codex",
   displayName: "Codex CLI",
   defaultTransport: "print",
+  thinkingEffort: true,
 
   print: {
     resumeCapable: true,

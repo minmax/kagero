@@ -13,11 +13,14 @@ import { chmodSync, copyFileSync, writeFileSync } from "node:fs";
 
 const FAKE = new URL("./helpers/fake-claude-stream.mjs", import.meta.url).pathname;
 
-async function makeAgent(mode: "echo" | "deny" = "echo"): Promise<{ agent: ClaudeStreamAgent; dir: string }> {
+async function makeAgent(
+  mode: "echo" | "deny" = "echo",
+  withoutNativeSessionId = false,
+): Promise<{ agent: ClaudeStreamAgent; dir: string }> {
   const dir = mkdtempSync(join(tmpdir(), "kagero-claude-stream-"));
   const bin = join(dir, "fake-claude");
   // Wrapper pins the mode per binary so env never leaks between tests.
-  const script = `#!/bin/sh\nFAKE_CLAUDE_MODE=${mode} exec node "${FAKE}" "$@"\n`;
+  const script = `#!/bin/sh\nFAKE_CLAUDE_MODE=${mode} FAKE_CLAUDE_NO_SESSION=${withoutNativeSessionId ? "1" : "0"} exec node "${FAKE}" "$@"\n`;
   writeFileSync(bin, script);
   chmodSync(bin, 0o755);
   process.env["CLAUDE_STREAM_BIN"] = bin;
@@ -45,6 +48,29 @@ describe("claude-stream agent", () => {
     const second = await agent.resume(first.sessionId ?? "x", "turn two", {});
     expect(second.status).toBe("completed");
     expect(second.text).toContain("PONG: turn two");
+  }, 15000);
+
+  it("reports the already-known native id through the per-run callback on resume", async () => {
+    const { agent } = await makeAgent("echo");
+    const earlyIds: string[] = [];
+    const startIds: string[] = [];
+    agent.subscribe("*", (event) => {
+      if (event.type === "session-start") startIds.push(event.sessionId);
+    });
+    const response = await agent.resume("native-resume", "continue", {
+      onSessionId: (id) => earlyIds.push(id),
+    });
+    expect(earlyIds).toEqual(["native-resume"]);
+    expect(startIds).toContain("native-resume");
+    expect(response.sessionId).toBe("native-resume");
+  }, 15000);
+
+  it("does not report its synthetic routing label as a native session id", async () => {
+    const { agent } = await makeAgent("echo", true);
+    const earlyIds: string[] = [];
+    const response = await agent.prompt("no session id", { onSessionId: (id) => earlyIds.push(id) });
+    expect(response.sessionId).toBeUndefined();
+    expect(earlyIds).toEqual([]);
   }, 15000);
 
   it("is_error results reject with the CLI message", async () => {

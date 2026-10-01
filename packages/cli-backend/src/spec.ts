@@ -105,6 +105,8 @@ export interface AcpTransportSpec {
   readonly args: readonly string[];
   /** `initialize` protocolVersion — some CLIs want a number, some a string. */
   readonly protocolVersion: number | string;
+  /** Override the initialize/session-open timeout (primarily for constrained agents and tests). */
+  readonly handshakeTimeoutMs?: number;
   /** Extra argv appended to the ACP invocation (e.g. passthrough flags). */
   extraArgs?(ctx: PromptContext): string[];
   /** _meta merged into session/new and session/load params (grok yoloMode). */
@@ -154,6 +156,8 @@ export interface CliSpec {
   readonly sessionsReader?: SessionsReader;
   readonly history?: HistoryReader;
   readonly limits?: LimitsSupport;
+  /** Whether this spec forwards PromptOptions.thinkingEffort to its CLI/ACP peer. */
+  readonly thinkingEffort?: boolean;
   /** Explicit capability overrides; otherwise derived from which spec parts exist. */
   readonly capabilities?: Partial<AgentCapabilities>;
   /**
@@ -192,6 +196,7 @@ export function deriveCapabilities(spec: CliSpec): AgentCapabilities {
       maxToolCalls: overrides?.limits?.maxToolCalls ?? spec.limits?.maxToolCalls !== undefined,
     },
     workspaceCreate: true,
+    thinkingEffort: overrides?.thinkingEffort ?? spec.thinkingEffort ?? false,
   };
 }
 

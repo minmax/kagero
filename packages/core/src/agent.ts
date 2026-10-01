@@ -105,6 +105,20 @@ export interface PromptOptions {
    * dsh `--patch <file>` paths, etc. The spec decides how each is carried.
    */
   readonly nativeOverrides?: readonly string[] | undefined;
+  /**
+   * Per-run, exact early session identity. Called at most once, with the
+   * backend's TRUE native, resumable session id, the moment the backend first
+   * knows it — for ACP once the session is open (before the turn is sent),
+   * for print transports that name the session upfront (`--session-id`) or
+   * resume one before the process starts, and for print runs that learn the
+   * id from the CLI's output right before the run resolves (the response
+   * carries it too). Backends whose only identifier is a placeholder (pi-rpc
+   * `rpc-N`, pi-sdk, claude-stream's `claude-…` label) never call it with
+   * that placeholder: no call means "no native id known yet", never a guess.
+   * An id passed here is routable through `abort(sessionId)` for this run.
+   * Exceptions thrown by the callback are swallowed.
+   */
+  readonly onSessionId?: ((sessionId: string) => void) | undefined;
 }
 
 /** Per-event payload for live observation. */
@@ -135,6 +149,8 @@ export interface AgentCapabilities {
     readonly maxToolCalls: boolean;
   };
   readonly workspaceCreate: boolean;
+  /** Accepts and forwards PromptOptions.thinkingEffort; absent means unsupported. */
+  readonly thinkingEffort?: boolean;
 }
 
 /** One normalized conversation entry for the unified history view. */

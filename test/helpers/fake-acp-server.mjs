@@ -16,6 +16,11 @@
 
 import { appendFileSync } from "node:fs";
 
+// `--sid <id>` on argv names the session session/new hands out (default
+// sess-fake-1), so concurrent fakes can be told apart.
+const sidFlag = process.argv.indexOf("--sid");
+const newSessionIdValue = sidFlag === -1 ? "sess-fake-1" : (process.argv[sidFlag + 1] ?? "sess-fake-1");
+
 const mode = process.env.FAKE_ACP_MODE ?? "answer";
 const logFile = process.env.FAKE_ACP_LOG;
 
@@ -96,11 +101,12 @@ function handleRequest(message) {
   const { id, method } = message;
   if (method === "initialize") {
     record({ method, params: message.params ?? null });
+    if (process.env.FAKE_ACP_HANG_INITIALIZE === "1") return;
     rpc(id, { protocolVersion: 1, agentCapabilities: { loadSession: true } });
     return;
   }
   if (method === "session/new") {
-    sessionId = "sess-fake-1";
+    sessionId = newSessionIdValue;
     record({ method, params: message.params ?? null });
     rpc(id, { sessionId, configOptions: [] });
     return;

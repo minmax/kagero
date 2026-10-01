@@ -58,6 +58,10 @@ describe("deriveCapabilities — honest defaults per built-in spec", () => {
     }
     expect(deriveCapabilities(claudeSpec).limits.maxTurns).toBe(true);
     expect(deriveCapabilities(codexSpec).limits.maxTurns).toBe(false);
+    expect(deriveCapabilities(claudeSpec).thinkingEffort).toBe(true);
+    expect(deriveCapabilities(codexSpec).thinkingEffort).toBe(true);
+    expect(deriveCapabilities(kimiSpec).thinkingEffort).toBe(true);
+    expect(deriveCapabilities(mcodeSpec).thinkingEffort).toBe(false);
   });
 
   it("qwen/grok/kimi/mcode: ACP default implies steer/followUp/resume", () => {
@@ -170,16 +174,21 @@ describe("dsh spec", () => {
 // --- claude ------------------------------------------------------------------------
 
 describe("claude spec", () => {
-  it("builds print argv: -p prompt, stream-json, model, max-turns, yolo", () => {
+  it("builds print argv: -p prompt, stream-json, model, effort, max-turns, yolo", () => {
     const args = claudeSpec.print?.args(
-      ctx({ prompt: "hi there", opts: { modelId: "haiku", maxTurns: 3, approvalMode: "yolo" } }),
+      ctx({
+        prompt: "hi there",
+        opts: { modelId: "sonnet", thinkingEffort: "medium", maxTurns: 3, approvalMode: "yolo" },
+      }),
     );
     expect(args).toEqual([
       "-p",
       "--output-format",
       "stream-json",
       "--model",
-      "haiku",
+      "sonnet",
+      "--effort",
+      "medium",
       "--max-turns",
       "3",
       "--dangerously-skip-permissions",

@@ -43,6 +43,7 @@ function fullCapabilities(): AgentCapabilities {
     followUp: true,
     limits: { timeout: true, maxTurns: true, maxToolCalls: true },
     workspaceCreate: true,
+    thinkingEffort: true,
   };
 }
 
@@ -360,6 +361,21 @@ describe("kagero MCP server", () => {
     expect(textOf(result)).toContain("[unsupported_capability]");
   });
 
+  it("refuses thinking_effort when a backend cannot forward it", async () => {
+    const { client } = await makeHarness({ thinkingEffort: false });
+    const result = await call(client, "kagero_run", { prompt: "go", thinking_effort: "medium" });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("[unsupported_capability]");
+    expect(textOf(result)).toContain("thinking_effort");
+  });
+
+  it("forwards thinking_effort to a backend that declares support", async () => {
+    const { client, agent } = await makeHarness({ thinkingEffort: true });
+    const result = await call(client, "kagero_run", { prompt: "go", thinking_effort: "medium" });
+    expect(result.isError).toBeFalsy();
+    expect(agent.promptCalls[0]?.opts?.thinkingEffort).toBe("medium");
+  });
+
   it("reports a timed-out run as isError without throwing", async () => {
     const { client, agent } = await makeHarness();
     agent.onPrompt(() =>
@@ -548,7 +564,7 @@ describe("kagero background tasks", () => {
     expect(textOf(output)).toContain("finished: succeeded");
   });
 
-  it("task_stop aborts the session and marks the task canceled", async () => {
+  it("task_stop sends abort and marks canceled only after the run reports aborted", async () => {
     const { client, agent, logs } = await makeHarness();
     agent.hold();
     const started = await call(client, "kagero_run", {
@@ -560,20 +576,16 @@ describe("kagero background tasks", () => {
 
     const stopped = await call(client, "kagero_task_stop", { task_id: taskId, reason: "no longer needed" });
     expect(stopped.isError).toBeFalsy();
-    expect(stopped._meta).toMatchObject({ taskId, status: "canceled" });
-    expect(textOf(stopped)).toContain("canceled task-1: no longer needed");
+    expect(stopped._meta).toMatchObject({ taskId, status: "running", cancelPending: true });
+    expect(textOf(stopped)).toContain("abort sent to task-1");
     expect(agent.abortCalls).toEqual(["sess-live"]);
 
-    const listing = jsonOf(await call(client, "kagero_task_list", { active_only: false }));
-    expect((listing.tasks as Record<string, unknown>[])[0]).toMatchObject({
-      task_id: taskId,
-      status: "canceled",
-    });
-
-    // The abort resolves the held run (status "aborted"); the cancel survives.
+    // The abort resolves the held run with status "aborted".
     await vi.waitFor(() =>
       expect(logs.some((l) => (l.data as Record<string, unknown>)?.["kind"] === "task-completed")).toBe(true),
     );
+    const listing = jsonOf(await call(client, "kagero_task_list", { active_only: false }));
+    expect((listing.tasks as Record<string, unknown>[])[0]).toMatchObject({ task_id: taskId, status: "canceled" });
     const note = logs.find((l) => (l.data as Record<string, unknown>)?.["kind"] === "task-completed");
     expect(note?.data).toMatchObject({ task_id: taskId, status: "canceled" });
     const all = jsonOf(await call(client, "kagero_task_list", { active_only: false }));

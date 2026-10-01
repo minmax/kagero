@@ -35,6 +35,7 @@ const kimiSpec: CliSpec = {
   binary: "kimi",
   displayName: "kimi-code",
   defaultTransport: "acp",
+  thinkingEffort: true,
 
   print: {
     resumeCapable: true,

@@ -26,6 +26,7 @@ const claudeSpec: CliSpec = {
   binary: "claude",
   displayName: "Claude Code",
   defaultTransport: "print",
+  thinkingEffort: true,
 
   print: {
     resumeCapable: true,
@@ -38,6 +39,7 @@ const claudeSpec: CliSpec = {
         "--output-format",
         "stream-json",
         ...(ctx.opts.modelId === undefined ? [] : ["--model", ctx.opts.modelId]),
+        ...(ctx.opts.thinkingEffort === undefined ? [] : ["--effort", ctx.opts.thinkingEffort]),
         ...(ctx.mode === "resume" && ctx.sessionId !== undefined ? ["--resume", ctx.sessionId] : []),
         ...(ctx.opts.maxTurns !== undefined ? ["--max-turns", String(ctx.opts.maxTurns)] : []),
         ...(ctx.opts.approvalMode === "yolo" ? ["--dangerously-skip-permissions"] : []),

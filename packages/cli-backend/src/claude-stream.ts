@@ -26,6 +26,12 @@
  * streaming is queued by claude itself — steer/follow_up are plain writes.
  * Resume: spawn with `--resume <sessionId>`; a prompt for a different
  * session respawns the process.
+ *
+ * Session identity: the id this agent routes a turn by (`claude-<ts>-…`,
+ * `claude-<resumeId>`) is a synthetic label. The NATIVE id is the session_id
+ * of the first stream frame; only that one reaches PromptOptions.onSessionId,
+ * and abort() accepts either. One turn at a time per process — concurrent
+ * runs need separate agents.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
@@ -121,7 +127,14 @@ const parseSlashCommands = (payload: Frame): SlashCommand[] => {
 };
 
 interface ActiveTurn {
+  /**
+   * SYNTHETIC routing label (`claude-<ts>-…` / `claude-<resumeId>`) — never
+   * reported as a native id through PromptOptions.onSessionId.
+   */
   sessionId: string;
+  /** The claude-reported session id, from the first stream frame that carries one. */
+  nativeSessionId: string | undefined;
+  onSessionId: ((sessionId: string) => void) | undefined;
   text: string[];
   thinking: string[];
   model: string | undefined;
@@ -223,14 +236,18 @@ export class ClaudeStreamAgent implements Agent {
 
   async abort(sessionId: string): Promise<void> {
     const active = this.active;
-    if (active !== undefined && active.sessionId === sessionId && !active.finished) {
+    if (
+      active !== undefined &&
+      (active.sessionId === sessionId || active.nativeSessionId === sessionId) &&
+      !active.finished
+    ) {
       this.writeInterrupt();
       // The interrupt control_response (or the turn's result frame) settles
       // the turn; a watchdog resolves it if the CLI never answers. Cancelled
       // turns deliver their own result frames — never pre-settle here.
       setTimeout(() => {
         const current = this.active;
-        if (current !== undefined && current.sessionId === sessionId && !current.finished) {
+        if (current === active && !current.finished) {
           this.finishAborted(current);
         }
       }, 5_000);
@@ -324,8 +341,13 @@ export class ClaudeStreamAgent implements Agent {
               });
             }
             let timer: NodeJS.Timeout | undefined;
+            const startedAt = Date.now();
             this.active = {
               sessionId,
+              // Let noteNativeSessionId publish resume ids through the same
+              // per-run callback path as ids learned from a fresh turn.
+              nativeSessionId: undefined,
+              onSessionId: opts.onSessionId,
               text: [],
               thinking: [],
               model: undefined,
@@ -341,10 +363,12 @@ export class ClaudeStreamAgent implements Agent {
                 fail(error);
               },
             };
-            const startedAt = Date.now();
-            this.emit(sessionId, { type: "session-start", sessionId, at: new Date().toISOString() });
             this.emit(sessionId, { type: "user-prompt", content: prompt, at: new Date().toISOString() });
             this.writeUserTurn(prompt);
+            // Publish a resume id only after the turn is on the wire. A caller
+            // may abort synchronously from this callback; sending the interrupt
+            // before the user turn would be dropped by the CLI.
+            if (opts.sessionId !== undefined) this.noteNativeSessionId(this.active, opts.sessionId);
             void proc; // close/error handlers own the failure path
             if (opts.timeoutMs !== undefined) {
               timer = setTimeout(() => {
@@ -368,6 +392,27 @@ export class ClaudeStreamAgent implements Agent {
     });
   }
 
+  /**
+   * The first frame session_id of a turn is claude's own (native, resumable)
+   * id: remember it so abort() can be routed by it, and tell the run's
+   * onSessionId observer exactly once.
+   */
+  private noteNativeSessionId(active: ActiveTurn | undefined, frameSessionId: string | undefined): void {
+    if (active === undefined || active.finished) return;
+    if (active.nativeSessionId !== undefined || frameSessionId === undefined) return;
+    active.nativeSessionId = frameSessionId;
+    this.emit(active.sessionId, {
+      type: "session-start",
+      sessionId: frameSessionId,
+      at: new Date().toISOString(),
+    });
+    try {
+      active.onSessionId?.(frameSessionId);
+    } catch {
+      // A broken observer must not break the turn.
+    }
+  }
+
   private failActive(message: string): void {
     const active = this.active;
     if (active === undefined || active.finished) return;
@@ -387,7 +432,7 @@ export class ClaudeStreamAgent implements Agent {
     active.settled({
       status: "timed-out",
       text: active.text.join("\n\n"),
-      sessionId: active.sessionId,
+      ...(active.nativeSessionId !== undefined ? { sessionId: active.nativeSessionId } : {}),
       durationMs: 0,
       meta: { partial: true },
     });
@@ -401,7 +446,7 @@ export class ClaudeStreamAgent implements Agent {
     active.settled({
       status: "aborted",
       text: active.text.join("\n\n"),
-      sessionId: active.sessionId,
+      ...(active.nativeSessionId !== undefined ? { sessionId: active.nativeSessionId } : {}),
       durationMs: 0,
       meta: { partial: true },
     });
@@ -587,6 +632,7 @@ export class ClaudeStreamAgent implements Agent {
     }
 
     const active = this.active;
+    this.noteNativeSessionId(active, str(frame["session_id"]));
     const sessionId =
       active !== undefined ? active.sessionId : (str(frame["session_id"]) ?? "claude-session");
     const emit = (e: AgentEvent): void => {
@@ -671,7 +717,6 @@ export class ClaudeStreamAgent implements Agent {
         if (active === undefined || active.finished) return;
         const isError = frame["is_error"] === true;
         const subtype = str(frame["subtype"]) ?? "unknown";
-        const resultSessionId = str(frame["session_id"]);
         if (isError) {
           const message = str(frame["result"]) ?? `claude result error (${subtype})`;
           this.emit(active.sessionId, { type: "error", message, at });
@@ -696,7 +741,7 @@ export class ClaudeStreamAgent implements Agent {
         active.settled({
           status: "completed",
           text: active.text.join("\n\n"),
-          sessionId: resultSessionId ?? active.sessionId,
+          ...(active.nativeSessionId !== undefined ? { sessionId: active.nativeSessionId } : {}),
           durationMs: 0,
           ...(active.model !== undefined ? { modelId: active.model, modelSource: "reported" as const } : {}),
           ...(inputTokens !== undefined || outputTokens !== undefined

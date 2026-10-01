@@ -21,6 +21,17 @@
  *    of that notification (which only aborted the handler's AbortSignal) —
  *    the Agent contract has no signal input, so the cancel must be routed to
  *    `agent.abort` explicitly.
+ *  - Early session identity: every run passes its OWN `onSessionId` closure
+ *    (PromptOptions), bound to that run's task / in-flight call — no wildcard
+ *    subscription, so parallel runs never attribute ids to each other. The id
+ *    lands on the task (`task_list` / `task_output`) as soon as the backend
+ *    reports its native id and is announced as a `session-started` logging
+ *    notification. A cancel (wire `notifications/cancelled` or `task_stop`)
+ *    that arrives before the id is known is remembered and delivered through
+ *    `agent.abort(id)` the moment the id appears; until then `task_stop`
+ *    answers "cancel pending" and keeps the task `running` — the registry
+ *    never claims `canceled` for a run nobody could actually stop. The run's
+ *    real outcome (`aborted` → `canceled`) decides the final status.
  *  - `stop()` disposes the registry; the task registry is server-lifetime
  *    memory (v1) and dies with the process.
  */
@@ -87,17 +98,61 @@ type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
 const READ_ONLY: ToolAnnotations = { readOnlyHint: true };
 
+/**
+ * Run-option schemas. Descriptions state ACTUAL per-backend support — an
+ * accepted field is not proof it takes effect (README: Security & behavior).
+ * Keep them in step with each backend's `capabilities.limits` and spec.
+ */
 function runOptionFields() {
   return {
     model_id: z.string().optional(),
     cwd: z.string().optional(),
-    timeout_ms: z.number().int().positive().optional(),
-    max_turns: z.number().int().positive().optional(),
-    max_tool_calls: z.number().int().positive().optional(),
+    timeout_ms: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        "Wall-clock checkpoint in ms; the run stops with status timed-out and the session stays resumable. " +
+          "Supported by claude, codex, dsh, grok, kimi, mcode, qwen. REJECTED with [unsupported_capability] by " +
+          "pi-sdk, pi-rpc and claude-stream. With run_in_background: true the backend must still support it, but " +
+          "the value is only a label — it does NOT stop the background run (use task_stop).",
+      ),
+    max_turns: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        "Turn cap. Supported ONLY by the claude backend (--max-turns); every other backend rejects it with " +
+          "[unsupported_capability] — omit it unless backend is claude.",
+      ),
+    max_tool_calls: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        "Tool-call cap. No registered backend supports it: it is always rejected with [unsupported_capability]. " +
+          "Omit it; bound a run with timeout_ms (where supported) or stop it with task_stop / send_message abort.",
+      ),
     approval_mode: z.enum(["default", "yolo"]).optional(),
     additional_dirs: z.array(z.string()).optional(),
-    thinking_effort: z.string().optional(),
-    native_overrides: z.array(z.string()).optional(),
+    thinking_effort: z
+      .string()
+      .optional()
+      .describe(
+        "Reasoning effort. Forwarded by claude (--effort), codex (model_reasoning_effort), and kimi (thinking config). " +
+          "Every other backend rejects it with [unsupported_capability]; omit unless using a supported backend. " +
+          "The accepted values depend on the backend/model.",
+      ),
+    native_overrides: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Verbatim per-run native overrides. Takes effect only on codex (-c key=value pairs) and dsh (--patch file " +
+          "paths); other backends accept the field and ignore it.",
+      ),
   };
 }
 
@@ -204,6 +259,12 @@ interface TaskEntry {
   sessionId?: string;
   agentName?: string;
   modelId?: string;
+  /**
+   * task_stop was asked while the run had no native session id (or is being
+   * routed): delivered through agent.abort the moment the id is reported.
+   */
+  cancelRequested?: boolean;
+  cancelReason?: string;
   /** timeout_ms is a label in background mode — it never aborts the run. */
   readonly timeoutLabelMs?: number;
   readonly startedAt: number;
@@ -216,6 +277,7 @@ interface RequestedLimits {
   timeout_ms?: number | undefined;
   max_turns?: number | undefined;
   max_tool_calls?: number | undefined;
+  thinking_effort?: string | undefined;
   workspace_create?: boolean | undefined;
 }
 
@@ -249,6 +311,7 @@ interface RunOptionsDraft {
   nativeOverrides?: readonly string[] | undefined;
   workspace?: WorkspaceOption;
   sessionId?: string;
+  onSessionId?: (sessionId: string) => void;
 }
 
 /** Mutable draft of {@link HistoryOptions}. */
@@ -263,7 +326,10 @@ interface InflightCall {
   readonly controller: AbortController;
   agent: Agent | undefined;
   sessionId: string | undefined;
-  cancelDelivered: boolean;
+  /** A wire-level cancel was seen for this call (it may still await a session id to be routed). */
+  cancelRequested: boolean;
+  /** The session id the last agent.abort was routed with (dedup of repeated cancels). */
+  abortedSessionId: string | undefined;
 }
 
 function defaultInstructions(prefix: string, backends: string[], defaultBackend: string): string {
@@ -345,12 +411,22 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
 
   function deliverCancel(entry: InflightCall): void {
     entry.controller.abort();
-    if (entry.cancelDelivered) return;
-    entry.cancelDelivered = true;
+    entry.cancelRequested = true;
+    routeCancel(entry, false);
+  }
+
+  /**
+   * Land a requested cancel on the backend through the run's session id. A
+   * cancel that arrived before the id was known stays requested; it is routed
+   * from the run's own onSessionId observer (`force`: an earlier abort for the
+   * same id may have hit a run that had not started yet).
+   */
+  function routeCancel(entry: InflightCall, force: boolean): void {
     const { agent, sessionId } = entry;
-    if (agent !== undefined && sessionId !== undefined) {
-      void agent.abort(sessionId).catch(() => undefined);
-    }
+    if (!entry.cancelRequested || agent === undefined || sessionId === undefined) return;
+    if (!force && entry.abortedSessionId === sessionId) return;
+    entry.abortedSessionId = sessionId;
+    void agent.abort(sessionId).catch(() => undefined);
   }
 
   function beginCall(requestId: RequestId): InflightCall {
@@ -358,7 +434,8 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
       controller: new AbortController(),
       agent: undefined,
       sessionId: undefined,
-      cancelDelivered: false,
+      cancelRequested: false,
+      abortedSessionId: undefined,
     };
     inflight.set(requestId, entry);
     return entry;
@@ -426,6 +503,9 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
 
   /** Refuse requested limits the backend honestly cannot honor. */
   function checkLimitCapabilities(caps: AgentCapabilities, requested: RequestedLimits): void {
+    if (requested.thinking_effort !== undefined && !caps.thinkingEffort) {
+      throw unsupportedCapability("thinking_effort", "Omit thinking_effort or pick a backend that forwards it.");
+    }
     if (requested.timeout_ms !== undefined && !caps.limits.timeout) {
       throw unsupportedCapability("timeout_ms", "Omit timeout_ms or pick a backend with timeout support.");
     }
@@ -450,8 +530,10 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
     args: RunArgsLike,
     includeSessionId: boolean,
     includeTimeout = true,
+    onSessionId?: (sessionId: string) => void,
   ): PromptOptions {
     const draft: RunOptionsDraft = {};
+    if (onSessionId !== undefined) draft.onSessionId = onSessionId;
     if (args.cwd !== undefined) draft.cwd = args.cwd;
     if (args.model_id !== undefined) draft.modelId = args.model_id;
     if (includeTimeout && args.timeout_ms !== undefined) draft.timeoutMs = args.timeout_ms;
@@ -507,11 +589,14 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
   /** Store the outcome and announce it as a logging notification. */
   function finishTask(task: TaskEntry, result: TaskResult): void {
     task.finishedAt = Date.now();
-    task.result = result;
-    // A task_stop cancel must survive a racing run outcome (the run resolves
-    // aborted after the abort, or completes before it lands): the caller asked
-    // for the cancellation, it stays the honest final status.
-    if (task.status !== "canceled") task.status = result.status;
+    const finalResult =
+      result.status === "canceled" && task.cancelRequested === true
+        ? { ...result, error: `canceled${task.cancelReason === undefined ? "" : `: ${task.cancelReason}`}` }
+        : result;
+    task.result = finalResult;
+    // A sent abort is only a request; the backend's actual outcome decides the
+    // final status.
+    task.status = finalResult.status;
     void server
       .sendLoggingMessage({
         level: "info",
@@ -521,7 +606,7 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
           task_id: task.taskId,
           status: task.status,
           session_id: task.sessionId,
-          summary: taskSummary(result),
+          summary: taskSummary(finalResult),
         },
       })
       .catch(() => undefined);
@@ -533,11 +618,48 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
     return "failed";
   }
 
+  /**
+   * The run's own early-id observer (PromptOptions.onSessionId): the native id
+   * lands on THIS task only, is announced, and a task_stop that was waiting
+   * for it is delivered now. The final status stays the run's outcome.
+   */
+  function onTaskSessionId(
+    task: TaskEntry,
+    agent: Agent,
+    sessionId: string,
+    inflight?: InflightCall,
+  ): void {
+    if (task.finishedAt !== undefined) return;
+    task.sessionId = sessionId;
+    announceSession(agent.name, sessionId, { task_id: task.taskId });
+    if (inflight !== undefined) {
+      inflight.sessionId = sessionId;
+      if (inflight.cancelRequested) task.cancelRequested = true;
+      if (inflight.cancelRequested) routeCancel(inflight, true);
+      else if (task.cancelRequested === true) void agent.abort(sessionId).catch(() => undefined);
+    } else if (task.cancelRequested === true) {
+      void agent.abort(sessionId).catch(() => undefined);
+    }
+  }
+
+  /** Tell the client a run's native session id is known (exact: carries task/request correlation). */
+  function announceSession(backend: string, sessionId: string, correlation: Record<string, unknown>): void {
+    void server
+      .sendLoggingMessage({
+        level: "info",
+        logger: opts.name,
+        data: { kind: "session-started", backend, session_id: sessionId, ...correlation },
+      })
+      .catch(() => undefined);
+  }
+
   /** Kick off a background run WITHOUT awaiting it; completion updates the registry. */
-  function startBackgroundRun(task: TaskEntry, agent: Agent, args: RunInput): void {
+  function startBackgroundRun(task: TaskEntry, agent: Agent, args: RunInput, inflight: InflightCall): void {
     const sessionId = args.session_id;
     const viaResume = sessionId !== undefined && agent.capabilities.resume;
-    const options = buildRunOptions(args, !viaResume, false);
+    const options = buildRunOptions(args, !viaResume, false, (reported) =>
+      onTaskSessionId(task, agent, reported, inflight),
+    );
     const pending = viaResume
       ? agent.resume(sessionId, args.prompt, options)
       : agent.prompt(args.prompt, options);
@@ -604,10 +726,10 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
       entry.sessionId = args.session_id;
       streamHub?.attach(agent);
       checkLimitCapabilities(agent.capabilities, args);
-      if (entry.cancelDelivered && args.session_id !== undefined) {
-        // The cancel raced ahead of backend selection — still land it.
-        void agent.abort(args.session_id).catch(() => undefined);
-      }
+      // A cancel that raced ahead of backend selection — land it when the
+      // session is already known (resume); a fresh run's id comes later, via
+      // the onSessionId observer below.
+      routeCancel(entry, false);
 
       if (args.run_in_background) {
         const taskId = `task-${nextTaskNumber}`;
@@ -618,12 +740,13 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
           status: "running",
           startedAt: Date.now(),
           ...(args.session_id !== undefined ? { sessionId: args.session_id } : {}),
+          ...(entry.cancelRequested ? { cancelRequested: true } : {}),
           ...(args.agent_name !== undefined ? { agentName: args.agent_name } : {}),
           ...(args.model_id !== undefined ? { modelId: args.model_id } : {}),
           ...(args.timeout_ms !== undefined ? { timeoutLabelMs: args.timeout_ms } : {}),
         };
         tasks.set(taskId, task);
-        startBackgroundRun(task, agent, args);
+        startBackgroundRun(task, agent, args, entry);
         return okResult(JSON.stringify({ task_id: taskId, status: "running" }), {
           taskId,
           status: "running",
@@ -631,10 +754,22 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
       }
 
       const continuing = args.session_id !== undefined;
+      const observe = (reported: string): void => {
+        entry.sessionId = reported;
+        announceSession(agent.name, reported, { request_id: extra.requestId });
+        // An earlier cancel may have targeted the resume id before the
+        // backend had registered this run; retry once the callback proves it
+        // is now an active run.
+        routeCancel(entry, true);
+      };
       const response =
         continuing && agent.capabilities.resume
-          ? await agent.resume(args.session_id as string, args.prompt, buildRunOptions(args, false))
-          : await agent.prompt(args.prompt, buildRunOptions(args, true));
+          ? await agent.resume(
+              args.session_id as string,
+              args.prompt,
+              buildRunOptions(args, false, true, observe),
+            )
+          : await agent.prompt(args.prompt, buildRunOptions(args, true, true, observe));
       return await responseResultWithReport(agent.name, response);
     } catch (error) {
       return toErrorResult(error);
@@ -681,6 +816,7 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
       status: task.status,
       ...(task.agentName !== undefined ? { agent_name: task.agentName } : {}),
       ...(task.modelId !== undefined ? { model_id: task.modelId } : {}),
+      ...(task.status === "running" && task.cancelRequested === true ? { cancel_pending: true } : {}),
       elapsed_ms: elapsedMs(task),
     }));
     return okResult(
@@ -702,7 +838,7 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
     const call = beginCall(extra.requestId);
     try {
       const deadline = Date.now() + args.wait_ms;
-      while (task.status === "running" && Date.now() < deadline && !call.cancelDelivered) {
+      while (task.status === "running" && Date.now() < deadline && !call.cancelRequested) {
         await sleep(25);
       }
     } finally {
@@ -712,10 +848,16 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
     const meta: Record<string, unknown> = { taskId: task.taskId, status: task.status };
     if (task.sessionId !== undefined) meta.sessionId = task.sessionId;
     if (task.modelId !== undefined) meta.modelId = task.modelId;
+    if (task.status === "running" && task.cancelRequested === true) meta.cancelPending = true;
     if (task.result?.usage !== undefined) meta.usage = task.result.usage;
 
     if (task.status === "running") {
-      return okResult(`${task.taskId} is still running (${Math.round(elapsedMs(task) / 100) / 10}s).`, meta);
+      const where = task.sessionId !== undefined ? `, session ${task.sessionId}` : "";
+      const pending = task.cancelRequested === true ? "; cancellation requested, awaiting run outcome" : "";
+      return okResult(
+        `${task.taskId} is still running (${Math.round(elapsedMs(task) / 100) / 10}s${where})${pending}.`,
+        meta,
+      );
     }
 
     const result = task.result;
@@ -741,26 +883,45 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
     if (task.status !== "running") {
       return errorResult(`[task_not_running] ${task.taskId} already finished: ${task.status}.`);
     }
-    if (task.sessionId !== undefined) {
-      const agent = await selectAgent(task.backend);
-      if (!agent.capabilities.abort) {
-        throw unsupportedCapability("abort", "Pick a backend whose runs can be stopped.");
-      }
-      await agent.abort(task.sessionId);
+    const agent = await selectAgent(task.backend);
+    if (!agent.capabilities.abort) {
+      throw unsupportedCapability("abort", "Pick a backend whose runs can be stopped.");
     }
-    task.finishedAt = Date.now();
-    task.status = "canceled";
-    task.result = {
-      status: "canceled",
-      text: task.result?.text ?? "",
-      ...(task.result?.report !== undefined ? { report: task.result.report } : {}),
-      ...(task.result?.usage !== undefined ? { usage: task.result.usage } : {}),
-      ...(args.reason !== undefined ? { error: `canceled: ${args.reason}` } : { error: "canceled" }),
-    };
-    return okResult(`canceled ${task.taskId}${args.reason === undefined ? "." : `: ${args.reason}`}`, {
-      taskId: task.taskId,
-      status: "canceled",
-    });
+    // The run may have settled while the backend was being selected.
+    if (task.status !== "running") {
+      return errorResult(`[task_not_running] ${task.taskId} already finished: ${task.status}.`);
+    }
+    task.cancelRequested = true;
+    if (args.reason !== undefined) task.cancelReason = args.reason;
+    const sessionId = task.sessionId;
+    if (sessionId === undefined) {
+      // No native session id yet: nothing can be aborted. Never mark the task
+      // canceled while the backend keeps running — the onSessionId observer
+      // delivers the abort the moment the id is reported, and the run's own
+      // outcome decides the final status.
+      return okResult(
+        `cancel requested for ${task.taskId}, NOT yet delivered: the backend has not reported a native session id, ` +
+          `so there is nothing to abort. The abort is sent the moment the id appears; the task stays running until ` +
+          `the run settles (a backend that only learns its session id at completion cannot be interrupted early).`,
+        { taskId: task.taskId, status: "running", cancelPending: true },
+      );
+    }
+    try {
+      await agent.abort(sessionId);
+    } catch (error) {
+      delete task.cancelRequested;
+      throw error;
+    }
+    if (task.status !== "running") {
+      return okResult(`${task.taskId} finished while the abort was being delivered: ${task.status}.`, {
+        taskId: task.taskId,
+        status: task.status,
+      });
+    }
+    return okResult(
+      `abort sent to ${task.taskId} (session ${sessionId}); the task stays running until the backend reports its outcome.`,
+      { taskId: task.taskId, status: "running", cancelPending: true },
+    );
   }
 
   async function handleHistory(args: HistoryInput): Promise<CallToolResult> {
@@ -810,7 +971,12 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
         `Returns the assistant text; _meta carries sessionId/status/model/workspace/usage. Timeouts and aborts come back ` +
         `as isError results naming the resumable session — the tool never throws. With run_in_background: true the call ` +
         `returns {task_id, status: "running"} immediately; poll ${prefix}_task_list / ${prefix}_task_output, stop with ` +
-        `${prefix}_task_stop; a "task-completed" logging notification announces the outcome.`,
+        `${prefix}_task_stop; a "task-completed" logging notification announces the outcome. A background task's ` +
+        `session id appears in task_list / task_output (and a "session-started" logging notification) as soon as the ` +
+        `backend reports its native id — ACP backends right after the session opens; print backends that only learn ` +
+        `the id from the CLI output expose it when the run ends. Limits are capability-gated per backend: see the ` +
+        `timeout_ms / max_turns / max_tool_calls descriptions (max_tool_calls is supported by no backend, max_turns ` +
+        `only by claude); unsupported values are rejected with [unsupported_capability], never silently dropped.`,
       inputSchema: RunInput,
     },
     (args, extra) => handleRun(args, extra),
@@ -860,7 +1026,13 @@ export function createKageroMcpServer(opts: KageroMcpServerOptions): {
     {
       title: "Kagero task stop",
       description:
-        "Cancel a running background task: aborts the underlying run (the session stays resumable) and marks the task canceled.",
+        "Request an abort for a running background task (the session stays resumable). The task stays running until " +
+        "the backend reports its outcome; only an actual aborted outcome marks it canceled. If the backend has not " +
+        "reported a native session id yet the abort cannot be sent: the reply says " +
+        '"NOT yet delivered" (_meta.cancelPending), and the abort is delivered the moment the ' +
+        "id appears. Backends that only learn their session id when " +
+        "the run ends (print transports without an upfront id, pi-rpc, pi-sdk, claude-stream before its first frame) " +
+        "cannot be interrupted before then.",
       inputSchema: TaskStopInput,
     },
     (args) => handleTaskStop(args).catch(toErrorResult),

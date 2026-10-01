@@ -20,6 +20,13 @@
  *    (parse/claude-lineage.ts `claudeLineageStream`) for callers that parse
  *    themselves; the backend does not re-assemble text from print streams.
  *
+ * PromptOptions.onSessionId is the per-run exact twin of session-start: it is
+ * fired once, from the same point, with the same native id (never the
+ * generated placeholder key of an ACP run whose spec also names print
+ * sessions upfront). A cancel that reaches an ACP run before its turn is sent
+ * (abort() sets a sticky flag) makes the run resolve "aborted" without ever
+ * prompting the backend.
+ *
  * Lifecycle events go to subscribers of the run's session id ("*" receives
  * everything): session-start when the session identity is first known
  * (upfront for resume and newSessionId specs and for ACP once the session
@@ -98,6 +105,14 @@ interface RunHandle {
   /** Every session id this run answers under (requested + reported). */
   sessionIds: Set<string>;
   startEmitted: boolean;
+  /** PromptOptions.onSessionId — fired once, with the native id, from emitSessionStart. */
+  onSessionId: ((sessionId: string) => void) | undefined;
+  /**
+   * abort() reached this run. Sticky: an ACP cancel that lands before the turn
+   * is sent has nothing to cancel in-protocol, so runAcp checks the flag right
+   * before prompting instead of letting the run proceed.
+   */
+  cancelRequested: boolean;
 }
 
 const stderrHead = (stderr: string): string => {
@@ -166,6 +181,8 @@ export class CliSpecAgent implements Agent {
       client: null,
       sessionIds: new Set<string>(),
       startEmitted: false,
+      onSessionId: opts.onSessionId,
+      cancelRequested: false,
     };
     handle.sessionIds.add(handle.key);
     this.activeRuns.set(handle.key, handle);
@@ -318,6 +335,7 @@ export class CliSpecAgent implements Agent {
     const client = new AcpClient({
       command: [binary.path, ...acp.args, ...(acp.extraArgs?.(ctx) ?? [])],
       cwd: ctx.workspace,
+      ...(acp.handshakeTimeoutMs === undefined ? {} : { handshakeTimeoutMs: acp.handshakeTimeoutMs }),
       protocolVersion: acp.protocolVersion,
       onEvent: (event, sessionId) => {
         const route = sessionId !== "" ? sessionId : handle.key;
@@ -339,10 +357,22 @@ export class CliSpecAgent implements Agent {
     const startedAt = Date.now();
     try {
       await client.start();
+    } catch (err) {
+      await client.dispose().catch(() => undefined);
+      throw new AgentError("spawn_failed", err instanceof Error ? err.message : String(err), "tool", {
+        binary: binary.path,
+        cwd: ctx.workspace,
+        phase: "spawn",
+      });
+    }
+    try {
       await client.initialize();
     } catch (err) {
-      throw new AgentError("spawn_failed", err instanceof Error ? err.message : String(err), "tool", {
-        binary: this.spec.binary,
+      await client.dispose().catch(() => undefined);
+      throw new AgentError("acp_initialize_failed", err instanceof Error ? err.message : String(err), "tool", {
+        binary: binary.path,
+        cwd: ctx.workspace,
+        phase: "initialize",
       });
     }
 
@@ -363,20 +393,33 @@ export class CliSpecAgent implements Agent {
         await client.newSession(config);
       }
     } catch (err) {
+      await client.dispose().catch(() => undefined);
       throw new AgentError(
-        "cli_error",
+        "acp_session_open_failed",
         `${this.spec.name} ACP session failed: ${err instanceof Error ? err.message : String(err)}`,
         "tool",
-        { binary: this.spec.binary },
+        { binary: binary.path, cwd: ctx.workspace, phase: "session-open" },
       );
     }
 
     const sessionId = client.sessionId;
     if (sessionId === null) {
-      throw new AgentError("cli_error", `${this.spec.name} ACP session did not open`, "tool", {});
+      await client.dispose().catch(() => undefined);
+      throw new AgentError(
+        "acp_session_open_failed",
+        `${this.spec.name} ACP session did not open`,
+        "tool",
+        { binary: binary.path, cwd: ctx.workspace, phase: "session-open" },
+      );
     }
     this.trackClient(sessionId, client);
+    // Fires PromptOptions.onSessionId: an abort delivered from inside it (a
+    // cancel that raced ahead of the id) sets cancelRequested right here.
     this.emitSessionStart(handle, sessionId);
+    if (handle.cancelRequested || handle.controller.signal.aborted) {
+      // Cancelled before the turn was sent: never prompt the backend.
+      return this.acpResponse("aborted", "", sessionId, ctx, startedAt, true);
+    }
     client.abortWith(handle.controller.signal);
 
     const timeoutMs = ctx.opts.timeoutMs ?? this.defaults.timeoutMs;
@@ -572,6 +615,7 @@ export class CliSpecAgent implements Agent {
   async abort(sessionId: string): Promise<void> {
     const handle = this.findBySession(sessionId);
     if (handle === null) return; // nothing in flight — idempotent no-op
+    handle.cancelRequested = true;
     if (handle.client !== null) {
       handle.client.cancel();
       return;
@@ -631,6 +675,11 @@ export class CliSpecAgent implements Agent {
     if (handle.startEmitted) return;
     handle.startEmitted = true;
     this.emit(handle, { type: "session-start", sessionId });
+    try {
+      handle.onSessionId?.(sessionId);
+    } catch {
+      // A broken observer must not break the run.
+    }
   }
 
   private dispatch(sessionId: string, event: AgentEvent): void {

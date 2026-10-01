@@ -101,6 +101,7 @@ afterEach(() => {
   delete process.env["FAKE_CLI_STDERR"];
   delete process.env["FAKE_ACP_MODE"];
   delete process.env["FAKE_ACP_LOG"];
+  delete process.env["FAKE_ACP_HANG_INITIALIZE"];
 });
 
 afterAll(() => {
@@ -316,6 +317,22 @@ describe("CliSpecAgent — print transport", () => {
 // --- ACP transport --------------------------------------------------------------------
 
 describe("CliSpecAgent — ACP transport", () => {
+  it("reports initialize timeout as an ACP handshake failure", async () => {
+    await withEnv({ FAKE_ACP_HANG_INITIALIZE: "1" }, async () => {
+      const spec = fakeAcpSpec();
+      const agent = new CliSpecAgent({
+        ...spec,
+        acp: { ...spec.acp!, handshakeTimeoutMs: 30 },
+      });
+      const result = await guard(agent.prompt("hello"));
+      expect(result).toBeInstanceOf(AgentError);
+      expect((result as AgentError).code).toBe("acp_initialize_failed");
+      expect((result as AgentError).message).toContain("initialize handshake timed out");
+      expect((result as AgentError).context).toMatchObject({ phase: "initialize", cwd: expect.any(String) });
+      await agent.dispose();
+    });
+  });
+
   it("runs a turn end-to-end: text, sessionId, session-start, no partial", async () => {
     const agent = new CliSpecAgent(fakeAcpSpec());
     const { events, unsubscribe } = collectEvents(agent);
@@ -335,10 +352,18 @@ describe("CliSpecAgent — ACP transport", () => {
   it("maps abort() to status aborted through in-protocol cancel", async () => {
     await withEnv({ FAKE_ACP_MODE: "wait" }, async () => {
       const agent = new CliSpecAgent(fakeAcpSpec());
+      let opened!: () => void;
+      const sessionOpened = new Promise<void>((resolve) => {
+        opened = resolve;
+      });
+      const unsubscribe = agent.subscribe("*", (event) => {
+        if (event.type === "session-start" && event.sessionId === "sess-fake-1") opened();
+      });
       const pending = guard(agent.prompt("hold"));
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await sessionOpened;
       await agent.abort("sess-fake-1");
       const response = await pending;
+      unsubscribe();
       expect(response).not.toBeInstanceOf(Error);
       expect((response as AgentResponse).status).toBe("aborted");
       expect((response as AgentResponse).meta?.partial).toBe(true);
@@ -349,8 +374,16 @@ describe("CliSpecAgent — ACP transport", () => {
   it("steers a live turn: cancel then re-prompt with the steering text", async () => {
     await withEnv({ FAKE_ACP_MODE: "wait" }, async () => {
       const agent = new CliSpecAgent(fakeAcpSpec());
+      const opened = new Promise<void>((resolve) => {
+        const unsubscribe = agent.subscribe("*", (event) => {
+          if (event.type === "session-start" && event.sessionId === "sess-fake-1") {
+            unsubscribe();
+            resolve();
+          }
+        });
+      });
       const pending = guard(agent.prompt("original"));
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await opened;
       await agent.send("sess-fake-1", "go left", "steer");
       const response = await pending;
       expect(response).not.toBeInstanceOf(Error);
@@ -466,9 +499,17 @@ describe("CliSpecAgent — discovery and lifecycle", () => {
   it("dispose stops an in-flight ACP run", async () => {
     await withEnv({ FAKE_ACP_MODE: "wait" }, async () => {
       const agent = new CliSpecAgent(fakeAcpSpec());
+      const opened = new Promise<void>((resolve) => {
+        const unsubscribe = agent.subscribe("*", (event) => {
+          if (event.type === "session-start" && event.sessionId === "sess-fake-1") {
+            unsubscribe();
+            resolve();
+          }
+        });
+      });
       // Attach the handler before dispose so the rejection is never unhandled.
       const guarded = guard(agent.prompt("hold"));
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await opened;
       await agent.dispose();
       const caught = await guarded;
       expect(caught).toBeInstanceOf(AgentError);

@@ -8,6 +8,14 @@
 //   FAKE_CLAUDE_MODE    echo (default) | deny  — deny rejects every prompt via
 //                       `result` is_error; echo answers "PONG: <last line>".
 
+import { appendFileSync } from "node:fs";
+
+const record = (event) => {
+  if (process.env.FAKE_CLAUDE_FRAME_LOG) {
+    appendFileSync(process.env.FAKE_CLAUDE_FRAME_LOG, `${event}\n`);
+  }
+};
+
 let buffer = "";
 let turn = 0;
 let reverseSeq = 0;
@@ -15,6 +23,7 @@ let lastReverseRequestId;
 let lastReverseReply;
 
 const send = (frame) => process.stdout.write(`${JSON.stringify(frame)}\n`);
+const sessionField = (sessionId) => (process.env.FAKE_CLAUDE_NO_SESSION === "1" ? {} : { session_id: sessionId });
 
 const answer = (sessionId, userText) => {
   if (process.env.FAKE_CLAUDE_MODE === "deny") {
@@ -23,7 +32,7 @@ const answer = (sessionId, userText) => {
       subtype: "error_during_execution",
       is_error: true,
       result: "fake denied this prompt",
-      session_id: sessionId,
+      ...sessionField(sessionId),
       usage: { input_tokens: 1, output_tokens: 0 },
     });
     return;
@@ -40,14 +49,14 @@ const answer = (sessionId, userText) => {
       model: "haiku",
       content: [{ type: "text", text: `PONG: ${userText}${reverseTag}` }],
     },
-    session_id: sessionId,
+    ...sessionField(sessionId),
   });
   send({
     type: "result",
     subtype: "success",
     is_error: false,
     result: `PONG: ${userText}`,
-    session_id: sessionId,
+    ...sessionField(sessionId),
     usage: { input_tokens: 10, output_tokens: 2 },
   });
 };
@@ -69,6 +78,7 @@ const onLine = (line) => {
   }
   if (frame.type === "control_request") {
     const subtype = frame.request?.subtype;
+    if (subtype === "interrupt") record("interrupt");
     // interrupt → success receipt (only when cancel_queued rode the wire)
     // plus the result frame the cancelled turn delivers on its own.
     if (subtype === "interrupt") {
@@ -86,7 +96,7 @@ const onLine = (line) => {
           subtype: "success",
           is_error: false,
           result: "interrupted",
-          session_id: lastSession,
+          ...sessionField(lastSession),
         });
       }
       return;
@@ -116,21 +126,23 @@ const onLine = (line) => {
           model: frame.request.model,
           content: [{ type: "text", text: `[model set: ${frame.request.model}]` }],
         },
-        session_id: sessionId,
+        ...sessionField(sessionId),
       });
     }
     return;
   }
   if (frame.type === "user") {
+    record("user");
     turn += 1;
     const sessionId = lastSession ?? `fake-claude-${Date.now()}`;
     if (lastSession === undefined) {
       lastSession = sessionId;
-      send({ type: "system", subtype: "init", session_id: sessionId, model: "haiku" });
+      send({ type: "system", subtype: "init", ...sessionField(sessionId), model: "haiku" });
     }
     const text =
       typeof frame.message?.content?.[0]?.text === "string" ? frame.message.content[0].text : "";
-    setTimeout(() => answer(sessionId, text), 30);
+    const delayMs = Number(process.env.FAKE_CLAUDE_DELAY_MS ?? 30);
+    setTimeout(() => answer(sessionId, text), delayMs);
   }
 };
 
