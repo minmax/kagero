@@ -12,6 +12,11 @@
 //                              every later prompt answers "steered:<text>"
 //   FAKE_ACP_ASK_PERMISSION=1  send session/request_permission before the first
 //                              turn's updates; wait for and log the client's answer
+//   FAKE_ACP_STDERR=<text>     written to stderr (plus a newline) when `initialize`
+//                              arrives — with FAKE_ACP_HANG_INITIALIZE=1 this is a child
+//                              that logs a diagnostic and then never answers
+//   FAKE_ACP_RECORD_PID=1      the initialize record also carries {pid} so a test can
+//                              check the child is gone after the stop ladder
 //   FAKE_ACP_TOOL_CALL=1       also emit one tool_call update before the chunks
 
 import { appendFileSync } from "node:fs";
@@ -100,7 +105,12 @@ const askPermissionThen = (play) => {
 function handleRequest(message) {
   const { id, method } = message;
   if (method === "initialize") {
-    record({ method, params: message.params ?? null });
+    record({
+      method,
+      params: message.params ?? null,
+      ...(process.env.FAKE_ACP_RECORD_PID === "1" ? { pid: process.pid } : {}),
+    });
+    if (process.env.FAKE_ACP_STDERR !== undefined) process.stderr.write(`${process.env.FAKE_ACP_STDERR}\n`);
     if (process.env.FAKE_ACP_HANG_INITIALIZE === "1") return;
     rpc(id, { protocolVersion: 1, agentCapabilities: { loadSession: true } });
     return;

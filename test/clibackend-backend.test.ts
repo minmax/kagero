@@ -35,6 +35,22 @@ interface RecordedCall {
   readonly args: string[];
 }
 
+// Fake diagnostic material: nothing here is a real credential.
+const SECRET_BEARER = "abcdef0123456789SECRETBEARERTOKEN";
+const SECRET_KEY = "sk-ant-api03-ZZZZZZZZZZZZZZZZZZZZZZZZ";
+const SECRET_ASSIGN = "hunter2-not-a-real-password";
+const SECRET_COOKIES = ["COOKIESECRET-ONE", "COOKIESECRET-TWO", "COOKIESECRET-THREE"];
+const PROMPT_CANARY = "PROMPT-CANARY-do-not-leak-4242 please refactor the billing module";
+
+const isGone = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ESRCH";
+  }
+};
+
 const readArgvLog = (file: string): RecordedCall[] =>
   readFileSync(file, "utf8")
     .split("\n")
@@ -102,6 +118,10 @@ afterEach(() => {
   delete process.env["FAKE_ACP_MODE"];
   delete process.env["FAKE_ACP_LOG"];
   delete process.env["FAKE_ACP_HANG_INITIALIZE"];
+  delete process.env["FAKE_ACP_STDERR"];
+  delete process.env["FAKE_ACP_RECORD_PID"];
+  delete process.env["FAKE_CLI_ERROR_TEXT"];
+  delete process.env["FAKE_CLI_ERROR_PAD"];
 });
 
 afterAll(() => {
@@ -238,6 +258,75 @@ describe("CliSpecAgent — print transport", () => {
     });
   });
 
+  it("surfaces a bounded, sanitized stdout error when stderr is empty on exit-error", async () => {
+    const agent = new CliSpecAgent(fakePrintSpec({}, { args: (ctx) => [FAKE_CLI, ctx.prompt] }));
+    await withEnv(
+      {
+        FAKE_CLI_MODE: "claude-error",
+        FAKE_CLI_EXIT_CODE: "1",
+        FAKE_CLI_ERROR_PAD: "6000",
+        // One header-style credential per line: a header value redacts to the end of its line.
+        FAKE_CLI_ERROR_TEXT: `STRUCTURED-ERROR-MARKER invalid effort\nAuthorization: Bearer ${SECRET_BEARER}\nANTHROPIC_API_KEY=${SECRET_KEY}\npassword=${SECRET_ASSIGN}\nrequest was`,
+      },
+      async () => {
+        const caught = await agent.prompt(PROMPT_CANARY).catch((err: unknown) => err);
+        expect(caught).toBeInstanceOf(AgentError);
+        const err = caught as AgentError;
+        expect(err.code).toBe("cli_error");
+        expect(err.context).toMatchObject({ exitCode: 1, stderrHead: "" });
+        const diagnostic = String(err.context?.["stdoutDiagnostic"]);
+        // The structured error survives; assistant text is not an error field.
+        expect(diagnostic).toContain("STRUCTURED-ERROR-MARKER");
+        expect(diagnostic).toContain("subtype=error_during_execution");
+        expect(diagnostic).not.toContain("ASSISTANT-TEXT-NOT-AN-ERROR-FIELD");
+        expect(err.message).toContain("exited with code 1: stdout: ");
+        expect(err.message).toContain("STRUCTURED-ERROR-MARKER");
+        // Bounded.
+        expect(diagnostic.length).toBeLessThanOrEqual(2_000);
+        expect(err.message.length).toBeLessThan(2_300);
+        // No prompt, no secrets — anywhere a caller can see.
+        const surfaced = `${err.message}\n${JSON.stringify(err.context)}`;
+        expect(surfaced).not.toContain("PROMPT-CANARY");
+        expect(surfaced).not.toContain("billing module");
+        for (const secret of [SECRET_BEARER, SECRET_KEY, SECRET_ASSIGN]) {
+          expect(surfaced).not.toContain(secret);
+        }
+        expect(diagnostic).toContain("[REDACTED]");
+        expect(diagnostic).toContain("[PROMPT]");
+      },
+    );
+  });
+
+  it("falls back to a bounded sanitized stdout tail when stdout has no structured error", async () => {
+    const agent = new CliSpecAgent(fakePrintSpec({}, { args: (ctx) => [FAKE_CLI, ctx.prompt] }));
+    // dsh mode prints one completed RunReport on stdout; exit 2 makes it a CLI failure.
+    await withEnv({ FAKE_CLI_MODE: "dsh", FAKE_CLI_EXIT_CODE: "2" }, async () => {
+      const caught = await agent.prompt(PROMPT_CANARY).catch((err: unknown) => err);
+      expect(caught).toBeInstanceOf(AgentError);
+      const err = caught as AgentError;
+      expect(err.code).toBe("cli_error");
+      const diagnostic = String(err.context?.["stdoutDiagnostic"]);
+      expect(diagnostic.length).toBeLessThanOrEqual(1_000);
+      expect(`${err.message}${JSON.stringify(err.context)}`).not.toContain("PROMPT-CANARY");
+      expect(diagnostic).toContain("[PROMPT]");
+    });
+  });
+
+  it("redacts the prompt and secrets from stderr on exit-error and bounds the head", async () => {
+    const agent = new CliSpecAgent(fakePrintSpec({}, { args: (ctx) => [FAKE_CLI, ctx.prompt] }));
+    const stderr = `boom ${PROMPT_CANARY} token=${SECRET_KEY}\n${"filler line\n".repeat(500)}`;
+    await withEnv({ FAKE_CLI_EXIT_CODE: "3", FAKE_CLI_STDERR: stderr }, async () => {
+      const caught = await agent.prompt(PROMPT_CANARY).catch((err: unknown) => err);
+      const err = caught as AgentError;
+      expect(err.code).toBe("cli_error");
+      expect(String(err.context?.["stderrHead"]).length).toBeLessThanOrEqual(2_000);
+      const surfaced = `${err.message}${JSON.stringify(err.context)}`;
+      expect(surfaced).toContain("boom [PROMPT] token=[REDACTED]");
+      expect(surfaced).not.toContain("PROMPT-CANARY");
+      expect(surfaced).not.toContain(SECRET_KEY);
+    });
+  });
+
   it("throws AgentError('spawn_failed') when the file cannot be executed", async () => {
     const notExecutable = join(workspaceDir, "not-executable");
     writeFileSync(notExecutable, "#!/bin/sh\nexit 0\n");
@@ -329,6 +418,168 @@ describe("CliSpecAgent — ACP transport", () => {
       expect((result as AgentError).code).toBe("acp_initialize_failed");
       expect((result as AgentError).message).toContain("initialize handshake timed out");
       expect((result as AgentError).context).toMatchObject({ phase: "initialize", cwd: expect.any(String) });
+      await agent.dispose();
+    });
+  });
+
+  it("surfaces a bounded sanitized stderr tail on an initialize timeout and finishes the stop ladder", async () => {
+    const stderr = [
+      "filler line\n".repeat(700), // 8.4 KB: older than both the 4 KB capture and the 2 KB cap
+      `echoed request: ${PROMPT_CANARY}`,
+      `Authorization: Bearer ${SECRET_BEARER}`,
+      `ANTHROPIC_API_KEY=${SECRET_KEY}`,
+      `Cookie: session=${SECRET_COOKIES[0]}; csrftoken=${SECRET_COOKIES[1]}; theme=dark`,
+      `Set-Cookie: sid=${SECRET_COOKIES[2]}; Path=/; HttpOnly; SameSite=Lax`,
+      "FAKE-ACP-DIAG-MARKER agent-name migration waiting for lock",
+    ].join("\n");
+    const pidLog = join(workspaceDir, "acp-init-timeout.ndjson");
+    await withEnv(
+      {
+        FAKE_ACP_HANG_INITIALIZE: "1",
+        FAKE_ACP_STDERR: stderr,
+        FAKE_ACP_RECORD_PID: "1",
+        FAKE_ACP_LOG: pidLog,
+      },
+      async () => {
+        const spec = fakeAcpSpec();
+        const agent = new CliSpecAgent({ ...spec, acp: { ...spec.acp!, handshakeTimeoutMs: 1_500 } });
+        const result = await guard(agent.prompt(PROMPT_CANARY, { workspace: { path: workspaceDir } }));
+        expect(result).toBeInstanceOf(AgentError);
+        const err = result as AgentError;
+
+        // Code and phase mapping are unchanged.
+        expect(err.code).toBe("acp_initialize_failed");
+        expect(err.message).toContain("initialize handshake timed out after 1500 ms");
+        expect(err.context).toMatchObject({ phase: "initialize", cwd: expect.any(String) });
+
+        // The recognizable diagnostic survives, bounded and sanitized.
+        const tail = String(err.context?.["stderrTail"]);
+        expect(tail).toContain("FAKE-ACP-DIAG-MARKER agent-name migration waiting for lock");
+        expect(tail.length).toBeLessThanOrEqual(2_000);
+        expect(err.message).toContain("child stderr tail: ");
+        expect(err.message).toContain("FAKE-ACP-DIAG-MARKER");
+        expect(err.message.length).toBeLessThan(2_300);
+        expect(tail).toContain("[REDACTED]");
+        expect(tail).toContain("[PROMPT]");
+
+        // No prompt, no secret-like strings in the message or the context.
+        const surfaced = `${err.message}\n${JSON.stringify(err.context)}`;
+        expect(surfaced).not.toContain("PROMPT-CANARY");
+        expect(surfaced).not.toContain("billing module");
+        expect(surfaced).not.toContain(SECRET_BEARER);
+        expect(surfaced).not.toContain(SECRET_KEY);
+        for (const cookie of SECRET_COOKIES) expect(surfaced).not.toContain(cookie);
+        expect(surfaced).not.toContain("HttpOnly");
+
+        // The stop ladder completed: the throw waits for dispose, so the child is gone.
+        const initRecord = readFileSync(pidLog, "utf8")
+          .split("\n")
+          .filter((line) => line.trim() !== "")
+          .map((line) => JSON.parse(line) as { method?: string; pid?: number })
+          .find((entry) => entry.method === "initialize");
+        expect(typeof initRecord?.pid).toBe("number");
+        expect(isGone(initRecord?.pid ?? 0)).toBe(true);
+        await agent.dispose();
+      },
+    );
+  });
+
+  for (const shortPrompt of ["x", "ab", "help"]) {
+    it(`never lets a ${shortPrompt.length}-character prompt through the initialize stderr tail`, async () => {
+      const stderr = `request echoed: ${shortPrompt}\nsecond echo (${shortPrompt}) ${shortPrompt.toUpperCase()}\nFAKE-ACP-DIAG-MARKER lock wait`;
+      await withEnv({ FAKE_ACP_HANG_INITIALIZE: "1", FAKE_ACP_STDERR: stderr }, async () => {
+        const spec = fakeAcpSpec();
+        // Allow slower CI hosts to start the fake child before testing stderr redaction.
+        const agent = new CliSpecAgent({ ...spec, acp: { ...spec.acp!, handshakeTimeoutMs: 2_500 } });
+        const err = (await guard(
+          agent.prompt(shortPrompt, { workspace: { path: workspaceDir } }),
+        )) as AgentError;
+        // Error code and phase are preserved while the echo is redacted.
+        expect(err.code).toBe("acp_initialize_failed");
+        expect(err.context).toMatchObject({ phase: "initialize" });
+        const tail = String(err.context?.["stderrTail"]);
+        expect(tail).toContain("FAKE-ACP-DIAG-MARKER");
+        expect(tail).toContain("request echoed: [PROMPT]");
+        const standalone = new RegExp(`(^|[^\\p{L}\\p{N}_])${shortPrompt}([^\\p{L}\\p{N}_]|$)`, "iu");
+        expect(tail).not.toMatch(standalone);
+        expect(err.message).not.toMatch(standalone);
+        await agent.dispose();
+      });
+    });
+  }
+
+  it("never lets a one-character prompt through the print stdout diagnostic or stderr head", async () => {
+    const agent = new CliSpecAgent(fakePrintSpec({}, { args: (ctx) => [FAKE_CLI, ctx.prompt] }));
+    await withEnv(
+      {
+        FAKE_CLI_MODE: "claude-error",
+        FAKE_CLI_EXIT_CODE: "1",
+        FAKE_CLI_ERROR_TEXT: "STRUCTURED-ERROR-MARKER bad input",
+        FAKE_CLI_STDERR: "stderr echo: x",
+      },
+      async () => {
+        const err = (await agent.prompt("x").catch((e: unknown) => e)) as AgentError;
+        expect(err.code).toBe("cli_error");
+        expect(String(err.context?.["stdoutDiagnostic"])).toContain("STRUCTURED-ERROR-MARKER");
+        const surfaced = `${String(err.context?.["stdoutDiagnostic"])}\n${String(err.context?.["stderrHead"])}`;
+        expect(surfaced).toContain("[prompt: [PROMPT]]");
+        expect(surfaced).toContain("stderr echo: [PROMPT]");
+        expect(surfaced).not.toMatch(/(^|[^\p{L}\p{N}_])x([^\p{L}\p{N}_]|$)/u);
+      },
+    );
+  });
+
+  it("drops a >4 KiB Cookie line cut by the stderr tail cap instead of leaking its unlabelled remainder", async () => {
+    // 8.4 KB on one line: the 4 KB tail capture starts inside it, after the "Cookie:" label.
+    const stderr = `Cookie: ${"session=COOKIESECRET-LONG; ".repeat(300)}\nFAKE-ACP-DIAG-MARKER lock wait`;
+    await withEnv({ FAKE_ACP_HANG_INITIALIZE: "1", FAKE_ACP_STDERR: stderr }, async () => {
+      const spec = fakeAcpSpec();
+      const agent = new CliSpecAgent({ ...spec, acp: { ...spec.acp!, handshakeTimeoutMs: 1_000 } });
+      const err = (await guard(
+        agent.prompt("hello world", { workspace: { path: workspaceDir } }),
+      )) as AgentError;
+      expect(err.code).toBe("acp_initialize_failed");
+      const tail = String(err.context?.["stderrTail"]);
+      expect(tail).toContain("FAKE-ACP-DIAG-MARKER lock wait");
+      const surfaced = `${err.message}\n${JSON.stringify(err.context)}`;
+      expect(surfaced).not.toContain("COOKIESECRET");
+      expect(surfaced).not.toContain("session=");
+      await agent.dispose();
+    });
+  });
+
+  it("suppresses child output but keeps code and phase when padding hides the prompt from bounded sampling", async () => {
+    const hiddenPrompt = `${" ".repeat(70_000)}help${" ".repeat(70_000)}`;
+    await withEnv(
+      {
+        FAKE_ACP_HANG_INITIALIZE: "1",
+        FAKE_ACP_STDERR: "request echoed: help\nHELP failed\nFAKE-ACP-DIAG-MARKER",
+      },
+      async () => {
+        const spec = fakeAcpSpec();
+        const agent = new CliSpecAgent({ ...spec, acp: { ...spec.acp!, handshakeTimeoutMs: 800 } });
+        const err = (await guard(
+          agent.prompt(hiddenPrompt, { workspace: { path: workspaceDir } }),
+        )) as AgentError;
+        expect(err.code).toBe("acp_initialize_failed");
+        expect(err.context).toMatchObject({ phase: "initialize" });
+        const surfaced = `${err.message}\n${JSON.stringify(err.context)}`;
+        expect(surfaced).not.toMatch(/help/i);
+        expect(surfaced).not.toContain("FAKE-ACP-DIAG-MARKER");
+        expect(String(err.context?.["stderrTail"])).toContain("diagnostic suppressed");
+        await agent.dispose();
+      },
+    );
+  });
+
+  it("omits the stderr tail fields when the child wrote nothing before the initialize timeout", async () => {
+    await withEnv({ FAKE_ACP_HANG_INITIALIZE: "1" }, async () => {
+      const spec = fakeAcpSpec();
+      const agent = new CliSpecAgent({ ...spec, acp: { ...spec.acp!, handshakeTimeoutMs: 100 } });
+      const err = (await guard(agent.prompt("hello world"))) as AgentError;
+      expect(err.code).toBe("acp_initialize_failed");
+      expect(err.message).not.toContain("child stderr tail");
+      expect(err.context).not.toHaveProperty("stderrTail");
       await agent.dispose();
     });
   });

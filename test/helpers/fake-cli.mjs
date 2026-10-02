@@ -15,6 +15,10 @@
 //   FAKE_CLI_MODE=dsh         dsh-headless-bridge RunReport: one JSON line
 //                             ({status,text,sessionId,model,durationMs}) on
 //                             stdout; status "error" with FAKE_CLI_RESULT_ERROR
+//   FAKE_CLI_MODE=claude-error  claude stream-json that FAILS: assistant text, then a
+//                             `result` envelope with is_error whose `result` is
+//                             FAKE_CLI_ERROR_TEXT + the prompt echo + FAKE_CLI_ERROR_PAD
+//                             filler; stderr stays empty (pair with FAKE_CLI_EXIT_CODE=1)
 //   FAKE_CLI_MODE=sleep       hold for FAKE_CLI_SLEEP_MS ms, then print "late"
 //   FAKE_CLI_REPORT_MODEL=0   emit no model anywhere (requested-echo test)
 //   FAKE_CLI_NO_RESULT=1      omit the result envelope (partial test)
@@ -154,6 +158,24 @@ if (mode === "claude") {
           durationMs: 1,
         };
   out(`${JSON.stringify(report)}\n`);
+} else if (mode === "claude-error") {
+  const prompt = args[args.length - 1] ?? "";
+  const pad = "x".repeat(Number(process.env.FAKE_CLI_ERROR_PAD ?? "0"));
+  const lines = [
+    { type: "system", subtype: "init", session_id: "sess-fake-err" },
+    {
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "text", text: "ASSISTANT-TEXT-NOT-AN-ERROR-FIELD" }] },
+    },
+    {
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      result: `${process.env.FAKE_CLI_ERROR_TEXT ?? "failed"} [prompt: ${prompt}] ${pad}`,
+      session_id: "sess-fake-err",
+    },
+  ];
+  out(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
 } else if (mode === "sleep") {
   const ms = Number(process.env.FAKE_CLI_SLEEP_MS ?? "2000");
   // NOTE: no .unref() — the whole point is to keep the process alive.

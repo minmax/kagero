@@ -72,9 +72,11 @@ import type {
 import {
   AcpClient,
   AgentError,
+  extractStructuredError,
   resolveBinary,
   resolveWorkspace,
   runProcess,
+  sanitizeDiagnostic,
   unsupportedCapability,
 } from "@kagero/core";
 import type { CliSpec, ParsedRun, PrintParser, PromptContext } from "./spec.js";
@@ -88,8 +90,10 @@ export interface CliSpecAgentOptions {
   readonly probeTimeoutMs?: number;
 }
 
-/** Head of stderr in error messages — enough to diagnose, small enough to read. */
+/** Cap of one surfaced diagnostic field (stderr head, stdout error, ACP stderr tail). */
 const STDERR_HEAD = 2_000;
+/** Cap of the raw stdout tail used when stdout carries no structured error. */
+const STDOUT_TAIL = 1_000;
 const DEFAULT_PROBE_TIMEOUT_MS = 60_000;
 
 /** An AgentEvent without the `at` stamp; the backend adds it on emit. */
@@ -115,9 +119,24 @@ interface RunHandle {
   cancelRequested: boolean;
 }
 
-const stderrHead = (stderr: string): string => {
-  const text = stderr.trim();
-  return text.length <= STDERR_HEAD ? text : text.slice(0, STDERR_HEAD);
+/**
+ * Bounded, sanitized head of stderr: secret formats and the prompt are
+ * redacted, so it can go into messages, AgentError.context and receipts.
+ */
+const stderrHead = (stderr: string, prompt?: string): string =>
+  sanitizeDiagnostic(stderr, { maxChars: STDERR_HEAD, redact: prompt === undefined ? [] : [prompt] });
+
+/**
+ * What a failed print run said on stdout (some CLIs, e.g. claude stream-json,
+ * report errors there with empty stderr): the structured error envelope when
+ * there is one, else a short sanitized tail. Never the whole stream.
+ */
+const stdoutDiagnostic = (stdout: string, prompt: string): string => {
+  const redact = [prompt];
+  return (
+    extractStructuredError(stdout, { redact, maxChars: STDERR_HEAD }) ??
+    sanitizeDiagnostic(stdout, { from: "tail", maxChars: STDOUT_TAIL, redact })
+  );
 };
 
 export class CliSpecAgent implements Agent {
@@ -255,26 +274,28 @@ export class CliSpecAgent implements Agent {
     }
 
     if (run.status === "exit-error" || run.status === "spawn-failed") {
-      const head = stderrHead(run.stderr);
+      const head = stderrHead(run.stderr, ctx.prompt);
+      const outDiag = run.status === "exit-error" ? stdoutDiagnostic(run.stdout, ctx.prompt) : "";
       const detail =
         run.status === "spawn-failed"
           ? `failed to spawn ${this.spec.binary}`
           : `${this.spec.binary} exited with code ${String(run.exitCode)}${run.signal === null ? "" : ` (signal ${run.signal})`}`;
       throw new AgentError(
         run.status === "spawn-failed" ? "spawn_failed" : "cli_error",
-        head === "" ? detail : `${detail}: ${head}`,
+        head !== "" ? `${detail}: ${head}` : outDiag === "" ? detail : `${detail}: stdout: ${outDiag}`,
         "tool",
         {
           exitCode: run.exitCode,
           signal: run.signal,
           stderrHead: head,
+          ...(outDiag === "" ? {} : { stdoutDiagnostic: outDiag }),
           binary: this.spec.binary,
         },
       );
     }
 
     const notCompleted = run.status !== "completed";
-    const parsed = this.parsePrintSafely(print.parse, run);
+    const parsed = this.parsePrintSafely(print.parse, run, ctx.prompt);
     if (parsed.sessionId !== undefined) this.emitSessionStart(handle, parsed.sessionId);
 
     const modelId = parsed.modelId ?? ctx.opts.modelId;
@@ -305,7 +326,7 @@ export class CliSpecAgent implements Agent {
    * up — a broken partial stream degrades to empty text while the status from
    * RunStatus stays honest.
    */
-  private parsePrintSafely(parse: PrintParser, run: RunResult): ParsedRun {
+  private parsePrintSafely(parse: PrintParser, run: RunResult, prompt: string): ParsedRun {
     try {
       return parse(run.stdout, run.stderr, run);
     } catch (err) {
@@ -313,9 +334,9 @@ export class CliSpecAgent implements Agent {
       if (run.status === "completed") {
         throw new AgentError(
           "cli_error",
-          `could not parse ${this.spec.name} output: ${err instanceof Error ? err.message : String(err)}`,
+          `could not parse ${this.spec.name} output: ${sanitizeDiagnostic(err instanceof Error ? err.message : String(err), { redact: [prompt] })}`,
           "tool",
-          { stderrHead: stderrHead(run.stderr) },
+          { stderrHead: stderrHead(run.stderr, prompt) },
         );
       }
       return { text: "" };
@@ -351,6 +372,7 @@ export class CliSpecAgent implements Agent {
         ? {}
         : { clientCapabilitiesMeta: this.spec.acp.clientCapabilitiesMeta }),
       ...(ctx.opts.additionalDirs === undefined ? {} : { additionalDirectories: ctx.opts.additionalDirs }),
+      redact: [ctx.prompt],
     });
     handle.client = client;
 
@@ -359,20 +381,24 @@ export class CliSpecAgent implements Agent {
       await client.start();
     } catch (err) {
       await client.dispose().catch(() => undefined);
-      throw new AgentError("spawn_failed", err instanceof Error ? err.message : String(err), "tool", {
+      const failure = this.acpFailure(err, client, ctx);
+      throw new AgentError("spawn_failed", failure.message, "tool", {
         binary: binary.path,
         cwd: ctx.workspace,
         phase: "spawn",
+        ...failure.context,
       });
     }
     try {
       await client.initialize();
     } catch (err) {
       await client.dispose().catch(() => undefined);
-      throw new AgentError("acp_initialize_failed", err instanceof Error ? err.message : String(err), "tool", {
+      const failure = this.acpFailure(err, client, ctx);
+      throw new AgentError("acp_initialize_failed", failure.message, "tool", {
         binary: binary.path,
         cwd: ctx.workspace,
         phase: "initialize",
+        ...failure.context,
       });
     }
 
@@ -394,11 +420,12 @@ export class CliSpecAgent implements Agent {
       }
     } catch (err) {
       await client.dispose().catch(() => undefined);
+      const failure = this.acpFailure(err, client, ctx);
       throw new AgentError(
         "acp_session_open_failed",
-        `${this.spec.name} ACP session failed: ${err instanceof Error ? err.message : String(err)}`,
+        `${this.spec.name} ACP session failed: ${failure.message}`,
         "tool",
-        { binary: binary.path, cwd: ctx.workspace, phase: "session-open" },
+        { binary: binary.path, cwd: ctx.workspace, phase: "session-open", ...failure.context },
       );
     }
 
@@ -435,7 +462,10 @@ export class CliSpecAgent implements Agent {
         // Deadline: the client already cancelled the turn in-protocol.
         return this.acpResponse("timed-out", "", sessionId, ctx, startedAt, true);
       }
-      throw new AgentError("cli_error", message, "tool", { sessionId, binary: this.spec.binary });
+      throw new AgentError("cli_error", sanitizeDiagnostic(message, { redact: [ctx.prompt] }), "tool", {
+        sessionId,
+        binary: this.spec.binary,
+      });
     }
 
     const status: AgentResponse["status"] =
@@ -445,6 +475,27 @@ export class CliSpecAgent implements Agent {
           ? "aborted"
           : "completed";
     return this.acpResponse(status, text, sessionId, ctx, startedAt, stopReason !== "end_turn");
+  }
+
+  /**
+   * A handshake-phase failure as surfaced to callers: the original error text
+   * (sanitized — an agent-supplied protocol message is untrusted too) plus the
+   * child's bounded, sanitized stderr tail, in the message and in
+   * `context.stderrTail`. The prompt and secret formats never get through.
+   */
+  private acpFailure(
+    err: unknown,
+    client: AcpClient,
+    ctx: PromptContext,
+  ): { message: string; context: { stderrTail?: string } } {
+    const base = sanitizeDiagnostic(err instanceof Error ? err.message : String(err), {
+      redact: [ctx.prompt],
+    });
+    const tail = client.stderrDiagnostic;
+    if (tail === "") return { message: base, context: {} };
+    // A child that died before the connection opened already carries the tail in its message.
+    const message = base.includes(tail) ? base : `${base}; child stderr tail: ${tail}`;
+    return { message, context: { stderrTail: tail } };
   }
 
   private acpResponse(

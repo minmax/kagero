@@ -30,6 +30,7 @@
 
 import { type ChildProcess, spawn } from "node:child_process";
 import type { AgentEvent } from "./agent.js";
+import { MAX_DIAGNOSTIC_CHARS, sanitizeDiagnostic } from "./diagnostics.js";
 
 /** An AgentEvent without the `at` stamp; the client adds it on emit. */
 type WithoutAt<T> = T extends { at: string } ? Omit<T, "at"> : T;
@@ -71,6 +72,8 @@ export interface AcpClientOptions {
    * pass "1" to match them byte-for-byte.
    */
   readonly protocolVersion?: number | string;
+  /** Strings (the user prompt) that must never appear in surfaced stderr diagnostics. */
+  readonly redact?: readonly string[];
 }
 
 /** One config option for session/set_config_option. */
@@ -148,6 +151,8 @@ export class AcpClient {
   private exited = false;
   private lineBuffer = "";
   private stderrTail = "";
+  /** The capped tail dropped older output, so its first line may be partial. */
+  private stderrTailCut = false;
   private sessionIdValue: string | null = null;
   private textChunks: string[] = [];
   private turn: Turn | null = null;
@@ -165,6 +170,20 @@ export class AcpClient {
   /** The open ACP session id, or null before session/new / session/load. */
   get sessionId(): string | null {
     return this.sessionIdValue;
+  }
+
+  /**
+   * Bounded, sanitized tail of the child's stderr (secret formats and the
+   * configured `redact` strings removed, capped) — safe for error messages,
+   * AgentError.context and receipts. Empty when the child wrote nothing.
+   */
+  get stderrDiagnostic(): string {
+    return sanitizeDiagnostic(this.stderrTail, {
+      from: "tail",
+      maxChars: MAX_DIAGNOSTIC_CHARS,
+      edgeCut: this.stderrTailCut,
+      ...(this.opts.redact === undefined ? {} : { redact: this.opts.redact }),
+    });
   }
 
   // --- lifecycle -------------------------------------------------------------
@@ -215,7 +234,7 @@ export class AcpClient {
       child.once("close", () => {
         if (!settled) {
           settled = true;
-          const tail = this.stderrTail.trim();
+          const tail = this.stderrDiagnostic;
           reject(
             new Error(
               `the ACP process ${command} exited before the connection opened${tail === "" ? "" : `: ${tail}`}`,
@@ -290,7 +309,7 @@ export class AcpClient {
     const hadBusiness = this.pending.size > 0 || this.turn !== null;
     this.rejectAll(EXITED_MESSAGE);
     if (hadBusiness) {
-      const tail = this.stderrTail.trim();
+      const tail = this.stderrDiagnostic;
       this.emit({
         type: "error",
         message: tail === "" ? EXITED_MESSAGE : `${EXITED_MESSAGE} stderr tail: ${tail}`,
@@ -534,7 +553,9 @@ export class AcpClient {
     // stderr is captured (capped) for diagnostics only; it is never a protocol stream.
     child.stderr?.setEncoding("utf8");
     child.stderr?.on("data", (chunk: string) => {
-      this.stderrTail = (this.stderrTail + chunk).slice(-MAX_STDERR_TAIL);
+      const combined = this.stderrTail + chunk;
+      if (combined.length > MAX_STDERR_TAIL) this.stderrTailCut = true;
+      this.stderrTail = combined.slice(-MAX_STDERR_TAIL);
     });
   }
 

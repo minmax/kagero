@@ -28,6 +28,13 @@ export type {
   WorkspaceOption,
 } from "./agent.js";
 export { AgentError, unsupportedCapability } from "./agent.js";
+export type { SanitizeDiagnosticOptions } from "./diagnostics.js";
+export {
+  extractStructuredError,
+  MAX_DIAGNOSTIC_CHARS,
+  redactSecrets,
+  sanitizeDiagnostic,
+} from "./diagnostics.js";
 export type {
   Digest,
   DigestBlock,
